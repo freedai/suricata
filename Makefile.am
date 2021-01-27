@@ -3,9 +3,10 @@
 AUTOMAKE_OPTIONS = foreign 1.4
 ACLOCAL_AMFLAGS = -I m4
 EXTRA_DIST = ChangeLog COPYING LICENSE suricata.yaml.in \
-             classification.config threshold.config \
-             reference.config $(SURICATA_UPDATE_DIR) \
-	     lua
+             threshold.config \
+             $(SURICATA_UPDATE_DIR) \
+	     lua \
+	     acsite.m4
 SUBDIRS = $(HTP_DIR) rust src qa rules doc contrib etc python ebpf \
           $(SURICATA_UPDATE_DIR)
 
@@ -22,8 +23,8 @@ install-full:
 install-conf:
 	install -d "$(DESTDIR)$(e_sysconfdir)"
 	@test -e "$(DESTDIR)$(e_sysconfdir)/suricata.yaml" || install -m 600 "$(top_srcdir)/suricata.yaml" "$(DESTDIR)$(e_sysconfdir)"
-	@test -e "$(DESTDIR)$(e_sysconfdir)/classification.config" || install -m 600 "$(top_srcdir)/classification.config" "$(DESTDIR)$(e_sysconfdir)"
-	@test -e "$(DESTDIR)$(e_sysconfdir)/reference.config" || install -m 600 "$(top_srcdir)/reference.config" "$(DESTDIR)$(e_sysconfdir)"
+	@test -e "$(DESTDIR)$(e_sysconfdir)/classification.config" || install -m 600 "$(top_srcdir)/etc/classification.config" "$(DESTDIR)$(e_sysconfdir)"
+	@test -e "$(DESTDIR)$(e_sysconfdir)/reference.config" || install -m 600 "$(top_srcdir)/etc/reference.config" "$(DESTDIR)$(e_sysconfdir)"
 	@test -e "$(DESTDIR)$(e_sysconfdir)/threshold.config" || install -m 600 "$(top_srcdir)/threshold.config" "$(DESTDIR)$(e_sysconfdir)"
 	install -d "$(DESTDIR)$(e_logfilesdir)"
 	install -d "$(DESTDIR)$(e_logcertsdir)"
@@ -31,14 +32,14 @@ install-conf:
 	install -m 770 -d "$(DESTDIR)$(e_localstatedir)"
 
 install-rules:
-if HAVE_SURICATA_UPDATE
-	$(DESTDIR)$(bindir)/suricata-update \
+if INSTALL_SURICATA_UPDATE
+	LD_LIBRARY_PATH=$(libdir) $(DESTDIR)$(bindir)/suricata-update \
 		--suricata $(DESTDIR)$(bindir)/suricata \
 		--suricata-conf $(DESTDIR)$(sysconfdir)/suricata/suricata.yaml \
 		--no-test --no-reload
 else
-	echo "error: rules not installed as suricata-update not available"
-	exit 1
+	@echo "error: rules not installed as suricata-update not available"
+	@exit 1
 endif
 	@echo ""
 	@echo "You can now start suricata by running as root something like:"

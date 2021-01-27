@@ -135,7 +135,7 @@ typedef struct THashDataConfig_ {
     int (*DataSet)(void *dst, void *src);
     void (*DataFree)(void *);
     uint32_t (*DataHash)(void *);
-    _Bool (*DataCompare)(void *, void *);
+    bool (*DataCompare)(void *, void *);
 } THashConfig;
 
 #define THASH_DATA_SIZE(ctx) (sizeof(THashData) + (ctx)->config.data_size)
@@ -152,6 +152,8 @@ typedef struct THashTableContext_ {
 
     THashConfig config;
 
+    /* flag set if memcap was reached at least once. */
+    SC_ATOMIC_DECLARE(bool, memcap_reached);
 } THashTableContext;
 
 /** \brief check if a memory alloc would fit in the memcap
@@ -183,11 +185,10 @@ typedef struct THashTableContext_ {
         }                                             \
     } while (0)
 
-THashTableContext* THashInit(const char *cnf_prefix, size_t data_size,
-    int (*DataSet)(void *dst, void *src),
-    void (*DataFree)(void *),
-    uint32_t (*DataHash)(void *),
-    _Bool (*DataCompare)(void *, void *));
+THashTableContext *THashInit(const char *cnf_prefix, size_t data_size,
+        int (*DataSet)(void *dst, void *src), void (*DataFree)(void *),
+        uint32_t (*DataHash)(void *), bool (*DataCompare)(void *, void *), bool reset_memcap,
+        uint64_t memcap, uint32_t hashsize);
 
 void THashShutdown(THashTableContext *ctx);
 
@@ -211,5 +212,7 @@ THashData *THashLookupFromHash (THashTableContext *ctx, void *data);
 THashDataQueue *THashDataQueueNew(void);
 void THashCleanup(THashTableContext *ctx);
 int THashWalk(THashTableContext *, THashFormatFunc, THashOutputFunc, void *);
+int THashRemoveFromHash (THashTableContext *ctx, void *data);
+void THashConsolidateMemcap(THashTableContext *ctx);
 
 #endif /* __THASH_H__ */

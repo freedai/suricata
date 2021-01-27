@@ -235,13 +235,6 @@ static int ModbusGetAlstateProgress(void *modbus_tx, uint8_t direction)
     return 0;
 }
 
-/** \brief Get value for 'complete' status in Modbus
- */
-static int ModbusGetAlstateProgressCompletionStatus(uint8_t direction)
-{
-    return 1;
-}
-
 static void *ModbusGetTx(void *alstate, uint64_t tx_id)
 {
     ModbusState         *modbus = (ModbusState *) alstate;
@@ -262,16 +255,10 @@ static void *ModbusGetTx(void *alstate, uint64_t tx_id)
     return NULL;
 }
 
-static void ModbusSetTxLogged(void *alstate, void *vtx, LoggerId logged)
+static AppLayerTxData *ModbusGetTxData(void *vtx)
 {
     ModbusTransaction *tx = (ModbusTransaction *)vtx;
-    tx->logged = logged;
-}
-
-static LoggerId ModbusGetTxLogged(void *alstate, void *vtx)
-{
-    ModbusTransaction *tx = (ModbusTransaction *)vtx;
-    return tx->logged;
+    return &tx->tx_data;
 }
 
 static uint64_t ModbusGetTxCnt(void *alstate)
@@ -1265,9 +1252,9 @@ static int ModbusParseHeader(ModbusState   *modbus,
  * \param input     Input line of the command
  * \param input_len Length of the request
  *
- * \retval 1 when the command is parsed, 0 otherwise
+ * \retval AppLayerResult APP_LAYER_OK or APP_LAYER_ERROR
  */
-static int ModbusParseRequest(Flow                  *f,
+static AppLayerResult ModbusParseRequest(Flow       *f,
                               void                  *state,
                               AppLayerParserState   *pstate,
                               const uint8_t         *input,
@@ -1280,10 +1267,10 @@ static int ModbusParseRequest(Flow                  *f,
     ModbusTransaction   *tx;
     ModbusHeader        header;
 
-    if (input == NULL && AppLayerParserStateIssetFlag(pstate, APP_LAYER_PARSER_EOF)) {
-        SCReturnInt(1);
+    if (input == NULL && AppLayerParserStateIssetFlag(pstate, APP_LAYER_PARSER_EOF_TS)) {
+        SCReturnStruct(APP_LAYER_OK);
     } else if (input == NULL || input_len == 0) {
-        SCReturnInt(-1);
+        SCReturnStruct(APP_LAYER_ERROR);
     }
 
     while (input_len > 0) {
@@ -1292,17 +1279,17 @@ static int ModbusParseRequest(Flow                  *f,
 
         /* Extract MODBUS Header */
         if (ModbusParseHeader(modbus, &header, adu, adu_len))
-            SCReturnInt(0);
+            SCReturnStruct(APP_LAYER_OK);
 
         /* Update ADU length with length in Modbus header. */
         adu_len = (uint32_t) sizeof(ModbusHeader) + (uint32_t) header.length - 1;
         if (adu_len > input_len)
-            SCReturnInt(0);
+            SCReturnStruct(APP_LAYER_OK);
 
         /* Allocate a Transaction Context and add it to Transaction list */
         tx = ModbusTxAlloc(modbus);
         if (tx == NULL)
-            SCReturnInt(0);
+            SCReturnStruct(APP_LAYER_OK);
 
         /* Check MODBUS Header */
         ModbusCheckHeader(modbus, &header);
@@ -1320,7 +1307,7 @@ static int ModbusParseRequest(Flow                  *f,
         input_len   -= adu_len;
     }
 
-    SCReturnInt(1);
+    SCReturnStruct(APP_LAYER_OK);
 }
 
 /** \internal
@@ -1330,9 +1317,9 @@ static int ModbusParseRequest(Flow                  *f,
  * \param input     Input line of the command
  * \param input_len Length of the request
  *
- * \retval 1 when the command is parsed, 0 otherwise
+ * \retval AppLayerResult APP_LAYER_OK or APP_LAYER_ERROR
  */
-static int ModbusParseResponse(Flow                 *f,
+static AppLayerResult ModbusParseResponse(Flow      *f,
                                void                 *state,
                                AppLayerParserState  *pstate,
                                const uint8_t        *input,
@@ -1345,10 +1332,10 @@ static int ModbusParseResponse(Flow                 *f,
     ModbusState         *modbus = (ModbusState *) state;
     ModbusTransaction   *tx;
 
-    if (input == NULL && AppLayerParserStateIssetFlag(pstate, APP_LAYER_PARSER_EOF)) {
-        SCReturnInt(1);
+    if (input == NULL && AppLayerParserStateIssetFlag(pstate, APP_LAYER_PARSER_EOF_TC)) {
+        SCReturnStruct(APP_LAYER_OK);
     } else if (input == NULL || input_len == 0) {
-        SCReturnInt(-1);
+        SCReturnStruct(APP_LAYER_ERROR);
     }
 
     while (input_len > 0) {
@@ -1357,12 +1344,12 @@ static int ModbusParseResponse(Flow                 *f,
 
         /* Extract MODBUS Header */
         if (ModbusParseHeader(modbus, &header, adu, adu_len))
-            SCReturnInt(0);
+            SCReturnStruct(APP_LAYER_OK);
 
         /* Update ADU length with length in Modbus header. */
         adu_len = (uint32_t) sizeof(ModbusHeader) + (uint32_t) header.length - 1;
         if (adu_len > input_len)
-            SCReturnInt(0);
+            SCReturnStruct(APP_LAYER_OK);
 
         /* Find the transaction context thanks to transaction ID (and function code) */
         tx = ModbusTxFindByTransaction(modbus, header.transactionId);
@@ -1371,7 +1358,7 @@ static int ModbusParseResponse(Flow                 *f,
             /* and add it to Transaction list */
             tx = ModbusTxAlloc(modbus);
             if (tx == NULL)
-                SCReturnInt(0);
+                SCReturnStruct(APP_LAYER_OK);
 
             SCLogDebug("MODBUS_DECODER_EVENT_UNSOLICITED_RESPONSE");
             ModbusSetEvent(modbus, MODBUS_DECODER_EVENT_UNSOLICITED_RESPONSE);
@@ -1394,13 +1381,13 @@ static int ModbusParseResponse(Flow                 *f,
         input_len   -= adu_len;
     }
 
-    SCReturnInt(1);
+    SCReturnStruct(APP_LAYER_OK);
 }
 
 /** \internal
  *     \brief Function to allocate the Modbus state memory
  */
-static void *ModbusStateAlloc(void)
+static void *ModbusStateAlloc(void *orig_state, AppProto proto_orig)
 {
     ModbusState *modbus;
 
@@ -1490,9 +1477,7 @@ void RegisterModbusParsers(void)
                                                 proto_name, ALPROTO_MODBUS,
                                                 0, sizeof(ModbusHeader),
                                                 ModbusProbingParser, ModbusProbingParser)) {
-#ifndef AFLFUZZ_APPLAYER
                 return;
-#endif
             }
         }
 
@@ -1519,10 +1504,8 @@ void RegisterModbusParsers(void)
         }
         SCLogConfig("Modbus stream depth: %u", stream_depth);
     } else {
-#ifndef AFLFUZZ_APPLAYER
         SCLogConfig("Protocol detection and parser disabled for %s protocol.", proto_name);
         return;
-#endif
     }
     if (AppLayerParserConfParserEnabled("tcp", proto_name)) {
         AppLayerParserRegisterParser(IPPROTO_TCP, ALPROTO_MODBUS, STREAM_TOSERVER, ModbusParseRequest);
@@ -1534,14 +1517,12 @@ void RegisterModbusParsers(void)
                                                ModbusGetTxDetectState, ModbusSetTxDetectState);
 
         AppLayerParserRegisterGetTx(IPPROTO_TCP, ALPROTO_MODBUS, ModbusGetTx);
+        AppLayerParserRegisterTxDataFunc(IPPROTO_TCP, ALPROTO_MODBUS, ModbusGetTxData);
         AppLayerParserRegisterGetTxCnt(IPPROTO_TCP, ALPROTO_MODBUS, ModbusGetTxCnt);
-        AppLayerParserRegisterLoggerFuncs(IPPROTO_TCP, ALPROTO_MODBUS, ModbusGetTxLogged,
-                                          ModbusSetTxLogged);
         AppLayerParserRegisterTxFreeFunc(IPPROTO_TCP, ALPROTO_MODBUS, ModbusStateTxFree);
 
         AppLayerParserRegisterGetStateProgressFunc(IPPROTO_TCP, ALPROTO_MODBUS, ModbusGetAlstateProgress);
-        AppLayerParserRegisterGetStateProgressCompletionStatus(ALPROTO_MODBUS,
-                                                                ModbusGetAlstateProgressCompletionStatus);
+        AppLayerParserRegisterStateProgressCompletionStatus(ALPROTO_MODBUS, 1, 1);
 
         AppLayerParserRegisterGetEventInfo(IPPROTO_TCP, ALPROTO_MODBUS, ModbusStateGetEventInfo);
         AppLayerParserRegisterGetEventInfoById(IPPROTO_TCP, ALPROTO_MODBUS, ModbusStateGetEventInfoById);
@@ -1711,7 +1692,7 @@ static uint8_t readWriteMultipleRegistersRsp[] = {/* Transaction ID */          
                                                                                 0x00};
 
 /* Modbus Application Protocol Specification V1.1b3 6.8.1: 04 Force Listen Only Mode */
-/* Example of a request to to remote device to its Listen Only MOde for Modbus Communications. */
+/* Example of a request to to remote device to its Listen Only Mode for Modbus Communications. */
 static uint8_t forceListenOnlyMode[] = {/* Transaction ID */     0x0A, 0x00,
                                         /* Protocol ID */        0x00, 0x00,
                                         /* Length */             0x00, 0x06,

@@ -23,12 +23,11 @@
  */
 
 #include "suricata-common.h"
-#include "config.h"
 #include "conf.h"
 #include "runmodes.h"
 #include "util-conf.h"
 
-TmEcode ConfigSetLogDirectory(char *name)
+TmEcode ConfigSetLogDirectory(const char *name)
 {
     return ConfSetFinal("default-log-dir", name) ? TM_ECODE_OK : TM_ECODE_FAILED;
 }
@@ -51,7 +50,7 @@ const char *ConfigGetLogDirectory()
     return log_dir;
 }
 
-TmEcode ConfigCheckLogDirectory(const char *log_dir)
+TmEcode ConfigCheckLogDirectoryExists(const char *log_dir)
 {
     SCEnter();
 #ifdef OS_WIN32
@@ -74,7 +73,7 @@ TmEcode ConfigSetDataDirectory(char *name)
     size_t size = strlen(name) + 1;
     char tmp[size];
     strlcpy(tmp, name, size);
-    if (tmp[size - 2] == '/')
+    if (size > 2 && tmp[size - 2] == '/') // > 2 to allow just /
         tmp[size - 2] = '\0';
 
     return ConfSetFinal("default-data-dir", tmp) ? TM_ECODE_OK : TM_ECODE_FAILED;
@@ -95,7 +94,7 @@ const char *ConfigGetDataDirectory()
 #endif /* OS_WIN32 */
     }
 
-    SCLogNotice("returning '%s'", data_dir);
+    SCLogDebug("returning '%s'", data_dir);
     return data_dir;
 }
 
@@ -155,7 +154,6 @@ int ConfUnixSocketIsEnable(void)
     }
 
     if (!strcmp(value, "auto")) {
-#ifdef HAVE_LIBJANSSON
 #ifdef OS_WIN32
         return 0;
 #else
@@ -165,9 +163,6 @@ int ConfUnixSocketIsEnable(void)
         } else {
             return 0;
         }
-#endif
-#else
-        return 0;
 #endif
     }
 

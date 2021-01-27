@@ -1,4 +1,4 @@
-/* Copyright (C) 2019 Open Information Security Foundation
+/* Copyright (C) 2019-2020 Open Information Security Foundation
  *
  * You can copy, redistribute or modify this Program under the terms of
  * the GNU General Public License version 2 as published by the Free
@@ -25,10 +25,5 @@
 #define __APP_LAYER_SIP_H__
 
 void RegisterSIPParsers(void);
-void SIPParserRegisterTests(void);
-
-/** Opaque Rust types. */
-typedef struct SIPState_ SIPState;
-typedef struct SIPTransaction_ SIPTransaction;
 
 #endif /* __APP_LAYER_SIP_H__ */

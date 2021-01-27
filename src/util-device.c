@@ -141,7 +141,6 @@ int LiveRegisterDevice(const char *dev)
     SC_ATOMIC_INIT(pd->pkts);
     SC_ATOMIC_INIT(pd->drop);
     SC_ATOMIC_INIT(pd->invalid_checksums);
-    pd->ignore_checksum = 0;
     pd->id = LiveGetDeviceCount();
     TAILQ_INSERT_TAIL(&live_devices, pd, next);
 
@@ -189,6 +188,49 @@ const char *LiveGetDeviceName(int number)
 
     return NULL;
 }
+
+/**
+ *  \brief Get the number of pre registered devices
+ *
+ *  \retval cnt the number of pre registered devices
+ */
+int LiveGetDeviceNameCount(void)
+{
+    int i = 0;
+    LiveDeviceName *pd;
+
+    TAILQ_FOREACH(pd, &pre_live_devices, next) {
+        i++;
+    }
+
+    return i;
+}
+
+/**
+ *  \brief Get a pointer to the pre device name at idx
+ *
+ *  \param number idx of the pre device in our list
+ *
+ *  \retval ptr pointer to the string containing the device
+ *  \retval NULL on error
+ */
+const char *LiveGetDeviceNameName(int number)
+{
+    int i = 0;
+    LiveDeviceName *pd;
+
+    TAILQ_FOREACH(pd, &pre_live_devices, next) {
+        if (i == number) {
+            return pd->dev;
+        }
+
+        i++;
+    }
+
+    return NULL;
+}
+
+
 
 /** \internal
  *  \brief Shorten a device name that is to long
@@ -321,9 +363,6 @@ int LiveDeviceListClean()
 
         if (pd->dev)
             SCFree(pd->dev);
-        SC_ATOMIC_DESTROY(pd->pkts);
-        SC_ATOMIC_DESTROY(pd->drop);
-        SC_ATOMIC_DESTROY(pd->invalid_checksums);
         LiveDevFreeStorage(pd);
         SCFree(pd);
     }

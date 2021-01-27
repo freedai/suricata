@@ -22,7 +22,6 @@
 use nom;
 
 use crate::core::*;
-use crate::log::*;
 
 use crate::smb::smb::*;
 use crate::smb::dcerpc::*;
@@ -907,10 +906,14 @@ pub fn smb1_write_request_record<'b>(state: &mut SMBState, r: &SmbRecord<'b>)
                 Some(n) => n.to_vec(),
                 None => b"<unknown>".to_vec(),
             };
+            let mut set_event_fileoverlap = false;
             let found = match state.get_file_tx_by_fuid(&file_fid, STREAM_TOSERVER) {
                 Some((tx, files, flags)) => {
                     let file_id : u32 = tx.id as u32;
                     if let Some(SMBTransactionTypeData::FILE(ref mut tdf)) = tx.type_data {
+                        if rd.offset < tdf.file_tracker.tracked {
+                            set_event_fileoverlap = true;
+                        }
                         filetracker_newchunk(&mut tdf.file_tracker, files, flags,
                                 &file_name, rd.data, rd.offset,
                                 rd.len, 0, false, &file_id);
@@ -936,6 +939,9 @@ pub fn smb1_write_request_record<'b>(state: &mut SMBState, r: &SmbRecord<'b>)
                     if let Some(SMBTransactionTypeData::FILE(ref mut tdf)) = tx.type_data {
                         let file_id : u32 = tx.id as u32;
                         SCLogDebug!("FID {:?} found at tx {}", file_fid, tx.id);
+                        if rd.offset < tdf.file_tracker.tracked {
+                            set_event_fileoverlap = true;
+                        }
                         filetracker_newchunk(&mut tdf.file_tracker, files, flags,
                                 &file_name, rd.data, rd.offset,
                                 rd.len, 0, false, &file_id);
@@ -943,6 +949,9 @@ pub fn smb1_write_request_record<'b>(state: &mut SMBState, r: &SmbRecord<'b>)
                     }
                     tx.vercmd.set_smb1_cmd(SMB1_COMMAND_WRITE_ANDX);
                 }
+            }
+            if set_event_fileoverlap {
+                state.set_event(SMBEvent::FileOverlap);
             }
 
             state.set_file_left(STREAM_TOSERVER, rd.len, rd.data.len() as u32, file_fid.to_vec());
@@ -990,11 +999,15 @@ pub fn smb1_read_response_record<'b>(state: &mut SMBState, r: &SmbRecord<'b>)
                         Some(n) => n.to_vec(),
                         None => Vec::new(),
                     };
+                    let mut set_event_fileoverlap = false;
                     let found = match state.get_file_tx_by_fuid(&file_fid, STREAM_TOCLIENT) {
                         Some((tx, files, flags)) => {
                             if let Some(SMBTransactionTypeData::FILE(ref mut tdf)) = tx.type_data {
                                 let file_id : u32 = tx.id as u32;
                                 SCLogDebug!("FID {:?} found at tx {}", file_fid, tx.id);
+                                if offset < tdf.file_tracker.tracked {
+                                    set_event_fileoverlap = true;
+                                }
                                 filetracker_newchunk(&mut tdf.file_tracker, files, flags,
                                         &file_name, rd.data, offset,
                                         rd.len, 0, false, &file_id);
@@ -1008,12 +1021,18 @@ pub fn smb1_read_response_record<'b>(state: &mut SMBState, r: &SmbRecord<'b>)
                         if let Some(SMBTransactionTypeData::FILE(ref mut tdf)) = tx.type_data {
                             let file_id : u32 = tx.id as u32;
                             SCLogDebug!("FID {:?} found at tx {}", file_fid, tx.id);
+                            if offset < tdf.file_tracker.tracked {
+                                set_event_fileoverlap = true;
+                            }
                             filetracker_newchunk(&mut tdf.file_tracker, files, flags,
                                     &file_name, rd.data, offset,
                                     rd.len, 0, false, &file_id);
                             tdf.share_name = share_name;
                         }
                         tx.vercmd.set_smb1_cmd(SMB1_COMMAND_READ_ANDX);
+                    }
+                    if set_event_fileoverlap {
+                        state.set_event(SMBEvent::FileOverlap);
                     }
                 } else {
                     SCLogDebug!("SMBv1 READ response from PIPE");
@@ -1053,21 +1072,19 @@ fn smb1_request_record_generic<'b>(state: &mut SMBState, r: &SmbRecord<'b>, even
 /// on the response. We only create a tx for the response side
 /// if we didn't already update a tx, and we have to set events
 fn smb1_response_record_generic<'b>(state: &mut SMBState, r: &SmbRecord<'b>, events: Vec<SMBEvent>) {
-    // see if we want a tx per command
-    if smb1_create_new_tx(r.command) {
-        let tx_key = SMBCommonHdr::from1(r, SMBHDR_TYPE_GENERICTX);
-        let tx = state.get_generic_tx(1, r.command as u16, &tx_key);
-        if let Some(tx) = tx {
+    let tx_key = SMBCommonHdr::from1(r, SMBHDR_TYPE_GENERICTX);
+    match state.get_generic_tx(1, r.command as u16, &tx_key) {
+        Some(tx) => {
             tx.request_done = true;
             tx.response_done = true;
             SCLogDebug!("tx {} cmd {} is done", tx.id, r.command);
             tx.set_status(r.nt_status, r.is_dos_error);
             tx.set_events(events);
             return;
-        }
+        },
+        None => {},
     }
     if events.len() > 0 {
-        let tx_key = SMBCommonHdr::from1(r, SMBHDR_TYPE_GENERICTX);
         let tx = state.new_generic_tx(1, r.command as u16, tx_key);
         tx.request_done = true;
         tx.response_done = true;

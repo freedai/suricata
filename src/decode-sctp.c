@@ -60,12 +60,12 @@ static int DecodeSCTPPacket(ThreadVars *tv, Packet *p, const uint8_t *pkt, uint1
 }
 
 int DecodeSCTP(ThreadVars *tv, DecodeThreadVars *dtv, Packet *p,
-        const uint8_t *pkt, uint16_t len, PacketQueue *pq)
+        const uint8_t *pkt, uint16_t len)
 {
     StatsIncr(tv, dtv->counter_sctp);
 
     if (unlikely(DecodeSCTPPacket(tv, p,pkt,len) < 0)) {
-        p->sctph = NULL;
+        CLEAR_SCTP_PACKET(p);
         return TM_ECODE_FAILED;
     }
 

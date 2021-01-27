@@ -15,7 +15,6 @@
  * 02110-1301, USA.
  */
 
-use crate::log::*;
 use crate::smb::smb::*;
 use crate::smb::smb2::*;
 use crate::smb::smb2_records::*;
@@ -38,7 +37,7 @@ impl SMBTransactionIoctl {
 
 impl SMBState {
     pub fn new_ioctl_tx(&mut self, hdr: SMBCommonHdr, func: u32)
-        -> (&mut SMBTransaction)
+        -> &mut SMBTransaction
     {
         let mut tx = self.new_tx();
         tx.hdr = hdr;

@@ -1,4 +1,4 @@
-/* Copyright (C) 2017-2019 Open Information Security Foundation
+/* Copyright (C) 2017-2020 Open Information Security Foundation
  *
  * You can copy, redistribute or modify this Program under the terms of
  * the GNU General Public License version 2 as published by the Free
@@ -32,6 +32,8 @@
 #include "util-print.h"
 #include "util-crypt.h"     // encode base64
 #include "util-base64.h"    // decode base64
+#include "util-byte.h"
+#include "util-misc.h"
 
 SCMutex sets_lock = SCMUTEX_INITIALIZER;
 static Dataset *sets = NULL;
@@ -39,6 +41,14 @@ static uint32_t set_ids = 0;
 
 static int DatasetAddwRep(Dataset *set, const uint8_t *data, const uint32_t data_len,
         DataRepType *rep);
+
+static inline void DatasetUnlockData(THashData *d)
+{
+    (void) THashDecrUsecnt(d);
+    THashDataUnlock(d);
+}
+static bool DatasetIsStatic(const char *save, const char *load);
+static void GetDefaultMemcap(uint64_t *memcap, uint32_t *hashsize);
 
 enum DatasetTypes DatasetGetTypeFromString(const char *s)
 {
@@ -64,7 +74,7 @@ static Dataset *DatasetSearchByName(const char *name)
 {
     Dataset *set = sets;
     while (set) {
-        if (strcasecmp(name, set->name) == 0) {
+        if (strcasecmp(name, set->name) == 0 && set->hidden == false) {
             return set;
         }
         set = set->next;
@@ -131,12 +141,14 @@ static int ParseRepLine(const char *in, size_t ins, DataRepType *rep_out)
         return -1;
     }
 
-    int v = atoi(ptrs[0]);
-    if (v < 0 || v > USHRT_MAX) {
-        SCLogDebug("v %d", v);
+    uint16_t v = 0;
+    int r = StringParseU16RangeCheck(&v, 10, strlen(ptrs[0]), ptrs[0], 0, USHRT_MAX);
+    if (r != (int)strlen(ptrs[0])) {
+        SCLogError(SC_ERR_INVALID_NUMERIC_VALUE,
+                "'%s' is not a valid reputation value (0-65535)", ptrs[0]);
         return -1;
     }
-    SCLogDebug("v %d raw %s", v, ptrs[0]);
+    SCLogDebug("v %"PRIu16" raw %s", v, ptrs[0]);
 
     rep_out->value = v;
     return 0;
@@ -205,6 +217,7 @@ static int DatasetLoadMd5(Dataset *set)
                     (uint32_t)strlen(line), line);
         }
     }
+    THashConsolidateMemcap(set->hash);
 
     fclose(fp);
     SCLogConfig("dataset: %s loaded %u records", set->name, cnt);
@@ -270,6 +283,7 @@ static int DatasetLoadSha256(Dataset *set)
             cnt++;
         }
     }
+    THashConsolidateMemcap(set->hash);
 
     fclose(fp);
     SCLogConfig("dataset: %s loaded %u records", set->name, cnt);
@@ -305,6 +319,7 @@ static int DatasetLoadString(Dataset *set)
             line[strlen(line) - 1] = '\0';
             SCLogDebug("line: '%s'", line);
 
+            // coverity[alloc_strlen : FALSE]
             uint8_t decoded[strlen(line)];
             uint32_t len = DecodeBase64(decoded, (const uint8_t *)line, strlen(line), 1);
             if (len == 0)
@@ -321,6 +336,7 @@ static int DatasetLoadString(Dataset *set)
 
             *r = '\0';
 
+            // coverity[alloc_strlen : FALSE]
             uint8_t decoded[strlen(line)];
             uint32_t len = DecodeBase64(decoded, (const uint8_t *)line, strlen(line), 1);
             if (len == 0)
@@ -343,6 +359,7 @@ static int DatasetLoadString(Dataset *set)
             SCLogDebug("line with rep %s, %s", line, r);
         }
     }
+    THashConsolidateMemcap(set->hash);
 
     fclose(fp);
     SCLogConfig("dataset: %s loaded %u records", set->name, cnt);
@@ -361,7 +378,6 @@ static void DatasetGetPath(const char *in_path,
 {
     char path[PATH_MAX];
     struct stat st;
-    int ret;
 
     if (PathIsAbsolute(in_path)) {
         strlcpy(path, in_path, sizeof(path));
@@ -370,7 +386,7 @@ static void DatasetGetPath(const char *in_path,
     }
 
     const char *data_dir = ConfigGetDataDirectory();
-    if ((ret = stat(data_dir, &st)) != 0) {
+    if (stat(data_dir, &st) != 0) {
         SCLogDebug("data-dir '%s': %s", data_dir, strerror(errno));
         return;
     }
@@ -378,7 +394,7 @@ static void DatasetGetPath(const char *in_path,
     snprintf(path, sizeof(path), "%s/%s", data_dir, in_path); // TODO WINDOWS
 
     if (type == TYPE_LOAD) {
-        if ((ret = stat(path, &st)) != 0) {
+        if (stat(path, &st) != 0) {
             SCLogDebug("path %s: %s", path, strerror(errno));
             if (!g_system) {
                 snprintf(path, sizeof(path), "%s", in_path);
@@ -404,9 +420,15 @@ Dataset *DatasetFind(const char *name, enum DatasetTypes type)
     return set;
 }
 
-Dataset *DatasetGet(const char *name, enum DatasetTypes type,
-        const char *save, const char *load)
+Dataset *DatasetGet(const char *name, enum DatasetTypes type, const char *save, const char *load,
+        uint64_t memcap, uint32_t hashsize)
 {
+    uint64_t default_memcap = 0;
+    uint32_t default_hashsize = 0;
+    if (strlen(name) > DATASET_NAME_MAX_LEN) {
+        return NULL;
+    }
+
     SCMutexLock(&sets_lock);
     Dataset *set = DatasetSearchByName(name);
     if (set) {
@@ -414,7 +436,8 @@ Dataset *DatasetGet(const char *name, enum DatasetTypes type,
             SCLogError(SC_ERR_DATASET, "dataset %s already "
                     "exists and is of type %u",
                 set->name, set->type);
-            goto out_err;
+            SCMutexUnlock(&sets_lock);
+            return NULL;
         }
 
         if ((save == NULL || strlen(save) == 0) &&
@@ -426,13 +449,15 @@ Dataset *DatasetGet(const char *name, enum DatasetTypes type,
                     (save != NULL && strcmp(set->save, save) != 0)) {
                 SCLogError(SC_ERR_DATASET, "dataset %s save mismatch: %s != %s",
                         set->name, set->save, save);
-                goto out_err;
+                SCMutexUnlock(&sets_lock);
+                return NULL;
             }
             if ((load == NULL && strlen(set->load) > 0) ||
                     (load != NULL && strcmp(set->load, load) != 0)) {
                 SCLogError(SC_ERR_DATASET, "dataset %s load mismatch: %s != %s",
                         set->name, set->load, load);
-                goto out_err;
+                SCMutexUnlock(&sets_lock);
+                return NULL;
             }
         }
 
@@ -461,26 +486,34 @@ Dataset *DatasetGet(const char *name, enum DatasetTypes type,
         SCLogDebug("set \'%s\' loading \'%s\' from \'%s\'", set->name, load, set->load);
     }
 
+    char cnf_name[128];
+    snprintf(cnf_name, sizeof(cnf_name), "datasets.%s.hash", name);
+
+    GetDefaultMemcap(&default_memcap, &default_hashsize);
     switch (type) {
         case DATASET_TYPE_MD5:
-            set->hash = THashInit(name, sizeof(Md5Type), Md5StrSet,
-                    Md5StrFree, Md5StrHash, Md5StrCompare);
+            set->hash = THashInit(cnf_name, sizeof(Md5Type), Md5StrSet, Md5StrFree, Md5StrHash,
+                    Md5StrCompare, load != NULL ? 1 : 0, memcap > 0 ? memcap : default_memcap,
+                    hashsize > 0 ? hashsize : default_hashsize);
             if (set->hash == NULL)
                 goto out_err;
             if (DatasetLoadMd5(set) < 0)
                 goto out_err;
             break;
         case DATASET_TYPE_STRING:
-            set->hash = THashInit(name, sizeof(StringType), StringSet,
-                    StringFree, StringHash, StringCompare);
+            set->hash = THashInit(cnf_name, sizeof(StringType), StringSet, StringFree, StringHash,
+                    StringCompare, load != NULL ? 1 : 0, memcap > 0 ? memcap : default_memcap,
+                    hashsize > 0 ? hashsize : default_hashsize);
             if (set->hash == NULL)
                 goto out_err;
             if (DatasetLoadString(set) < 0)
                 goto out_err;
             break;
         case DATASET_TYPE_SHA256:
-            set->hash = THashInit(name, sizeof(Sha256Type), Sha256StrSet,
-                    Sha256StrFree, Sha256StrHash, Sha256StrCompare);
+            set->hash = THashInit(cnf_name, sizeof(Sha256Type), Sha256StrSet, Sha256StrFree,
+                    Sha256StrHash, Sha256StrCompare, load != NULL ? 1 : 0,
+                    memcap > 0 ? memcap : default_memcap,
+                    hashsize > 0 ? hashsize : default_hashsize);
             if (set->hash == NULL)
                 goto out_err;
             if (DatasetLoadSha256(set) < 0)
@@ -507,81 +540,190 @@ out_err:
     return NULL;
 }
 
-#define SETNAME_MAX 63
+static bool DatasetIsStatic(const char *save, const char *load)
+{
+    /* A set is static if it does not have any dynamic properties like
+     * save and/or state defined but has load defined.
+     * */
+    if ((load != NULL && strlen(load) > 0) &&
+            (save == NULL || strlen(save) == 0)) {
+        return true;
+    }
+    return false;
+}
+
+void DatasetReload(void)
+{
+    /* In order to reload the datasets, just mark the current sets as hidden
+     * and clean them up later.
+     * New datasets shall be created with the rule reload and do not require
+     * any intervention.
+     * */
+    SCMutexLock(&sets_lock);
+    Dataset *set = sets;
+    while (set) {
+        if (!DatasetIsStatic(set->save, set->load) || set->from_yaml == true) {
+            SCLogDebug("Not a static set, skipping %s", set->name);
+            set = set->next;
+            continue;
+        }
+        set->hidden = true;
+        SCLogDebug("Set %s at %p hidden successfully", set->name, set);
+        set = set->next;
+    }
+    SCMutexUnlock(&sets_lock);
+}
+
+void DatasetPostReloadCleanup(void)
+{
+    SCLogDebug("Post Reload Cleanup starting.. Hidden sets will be removed");
+    SCMutexLock(&sets_lock);
+    Dataset *cur = sets;
+    Dataset *prev = NULL;
+    while (cur) {
+        Dataset *next = cur->next;
+        if (cur->hidden == false) {
+            prev = cur;
+            cur = next;
+            continue;
+        }
+        // Delete the set in case it was hidden
+        if (prev != NULL) {
+            prev->next = next;
+        } else {
+            sets = next;
+        }
+        THashShutdown(cur->hash);
+        SCFree(cur);
+        cur = next;
+    }
+    SCMutexUnlock(&sets_lock);
+}
+
+static void GetDefaultMemcap(uint64_t *memcap, uint32_t *hashsize)
+{
+    const char *str = NULL;
+    if (ConfGetValue("datasets.defaults.memcap", &str) == 1) {
+        if (ParseSizeStringU64(str, memcap) < 0) {
+            SCLogWarning(SC_ERR_INVALID_VALUE,
+                    "memcap value cannot be deduced: %s,"
+                    " resetting to default",
+                    str);
+            *memcap = 0;
+        }
+    }
+    if (ConfGetValue("datasets.defaults.hashsize", &str) == 1) {
+        if (ParseSizeStringU32(str, hashsize) < 0) {
+            SCLogWarning(SC_ERR_INVALID_VALUE,
+                    "hashsize value cannot be deduced: %s,"
+                    " resetting to default",
+                    str);
+            *hashsize = 0;
+        }
+    }
+}
 
 int DatasetsInit(void)
 {
     SCLogDebug("datasets start");
     int n = 0;
     ConfNode *datasets = ConfGetNode("datasets");
+    uint64_t default_memcap = 0;
+    uint32_t default_hashsize = 0;
+    GetDefaultMemcap(&default_memcap, &default_hashsize);
     if (datasets != NULL) {
         int list_pos = 0;
         ConfNode *iter = NULL;
         TAILQ_FOREACH(iter, &datasets->head, next) {
-            if (iter->val == NULL) {
+            if (iter->name == NULL) {
                 list_pos++;
                 continue;
             }
 
             char save[PATH_MAX] = "";
             char load[PATH_MAX] = "";
+            uint64_t memcap = 0;
+            uint32_t hashsize = 0;
 
-            const char *set_name = iter->val;
-            if (strlen(set_name) > SETNAME_MAX) {
+            const char *set_name = iter->name;
+            if (strlen(set_name) > DATASET_NAME_MAX_LEN) {
                 FatalError(SC_ERR_CONF_NAME_TOO_LONG, "set name '%s' too long, max %d chars",
-                        set_name, SETNAME_MAX);
-            }
-
-            ConfNode *set = ConfNodeLookupChild(iter, set_name);
-            if (set == NULL) {
-                list_pos++;
-                continue;
+                        set_name, DATASET_NAME_MAX_LEN);
             }
 
             ConfNode *set_type =
-                ConfNodeLookupChild(set, "type");
+                ConfNodeLookupChild(iter, "type");
             if (set_type == NULL) {
                 list_pos++;
                 continue;
             }
 
             ConfNode *set_save =
-                ConfNodeLookupChild(set, "state");
+                ConfNodeLookupChild(iter, "state");
             if (set_save) {
                 DatasetGetPath(set_save->val, save, sizeof(save), TYPE_STATE);
                 strlcpy(load, save, sizeof(load));
             } else {
                 ConfNode *set_load =
-                    ConfNodeLookupChild(set, "load");
+                    ConfNodeLookupChild(iter, "load");
                 if (set_load) {
                     DatasetGetPath(set_load->val, load, sizeof(load), TYPE_LOAD);
                 }
             }
 
+            ConfNode *set_memcap = ConfNodeLookupChild(iter, "memcap");
+            if (set_memcap) {
+                if (ParseSizeStringU64(set_memcap->val, &memcap) < 0) {
+                    SCLogWarning(SC_ERR_INVALID_VALUE,
+                            "memcap value cannot be"
+                            " deduced: %s, resetting to default",
+                            set_memcap->val);
+                    memcap = 0;
+                }
+            }
+            ConfNode *set_hashsize = ConfNodeLookupChild(iter, "hashsize");
+            if (set_hashsize) {
+                if (ParseSizeStringU32(set_hashsize->val, &hashsize) < 0) {
+                    SCLogWarning(SC_ERR_INVALID_VALUE,
+                            "hashsize value cannot be"
+                            " deduced: %s, resetting to default",
+                            set_hashsize->val);
+                    hashsize = 0;
+                }
+            }
             char conf_str[1024];
             snprintf(conf_str, sizeof(conf_str), "datasets.%d.%s", list_pos, set_name);
 
             SCLogDebug("(%d) set %s type %s. Conf %s", n, set_name, set_type->val, conf_str);
 
             if (strcmp(set_type->val, "md5") == 0) {
-                Dataset *dset = DatasetGet(set_name, DATASET_TYPE_MD5, save, load);
+                Dataset *dset = DatasetGet(set_name, DATASET_TYPE_MD5, save, load,
+                        memcap > 0 ? memcap : default_memcap,
+                        hashsize > 0 ? hashsize : default_hashsize);
                 if (dset == NULL)
                     FatalError(SC_ERR_FATAL, "failed to setup dataset for %s", set_name);
                 SCLogDebug("dataset %s: id %d type %s", set_name, n, set_type->val);
+                dset->from_yaml = true;
                 n++;
 
             } else if (strcmp(set_type->val, "sha256") == 0) {
-                Dataset *dset = DatasetGet(set_name, DATASET_TYPE_SHA256, save, load);
+                Dataset *dset = DatasetGet(set_name, DATASET_TYPE_SHA256, save, load,
+                        memcap > 0 ? memcap : default_memcap,
+                        hashsize > 0 ? hashsize : default_hashsize);
                 if (dset == NULL)
                     FatalError(SC_ERR_FATAL, "failed to setup dataset for %s", set_name);
                 SCLogDebug("dataset %s: id %d type %s", set_name, n, set_type->val);
+                dset->from_yaml = true;
                 n++;
 
             } else if (strcmp(set_type->val, "string") == 0) {
-                Dataset *dset = DatasetGet(set_name, DATASET_TYPE_STRING, save, load);
+                Dataset *dset = DatasetGet(set_name, DATASET_TYPE_STRING, save, load,
+                        memcap > 0 ? memcap : default_memcap,
+                        hashsize > 0 ? hashsize : default_hashsize);
                 if (dset == NULL)
                     FatalError(SC_ERR_FATAL, "failed to setup dataset for %s", set_name);
                 SCLogDebug("dataset %s: id %d type %s", set_name, n, set_type->val);
+                dset->from_yaml = true;
                 n++;
             }
 
@@ -690,10 +832,10 @@ static int DatasetLookupString(Dataset *set, const uint8_t *data, const uint32_t
     StringType lookup = { .ptr = (uint8_t *)data, .len = data_len, .rep.value = 0 };
     THashData *rdata = THashLookupFromHash(set->hash, &lookup);
     if (rdata) {
-        THashDataUnlock(rdata);
+        DatasetUnlockData(rdata);
         return 1;
     }
-    return -1;
+    return 0;
 }
 
 static DataRepResultType DatasetLookupStringwRep(Dataset *set,
@@ -710,7 +852,7 @@ static DataRepResultType DatasetLookupStringwRep(Dataset *set,
         StringType *found = rdata->data;
         rrep.found = true;
         rrep.rep = found->rep;
-        THashDataUnlock(rdata);
+        DatasetUnlockData(rdata);
         return rrep;
     }
     return rrep;
@@ -722,16 +864,16 @@ static int DatasetLookupMd5(Dataset *set, const uint8_t *data, const uint32_t da
         return -1;
 
     if (data_len != 16)
-        return 0;
+        return -1;
 
     Md5Type lookup = { .rep.value = 0 };
     memcpy(lookup.md5, data, data_len);
     THashData *rdata = THashLookupFromHash(set->hash, &lookup);
     if (rdata) {
-        THashDataUnlock(rdata);
+        DatasetUnlockData(rdata);
         return 1;
     }
-    return -1;
+    return 0;
 }
 
 static DataRepResultType DatasetLookupMd5wRep(Dataset *set,
@@ -752,7 +894,7 @@ static DataRepResultType DatasetLookupMd5wRep(Dataset *set,
         Md5Type *found = rdata->data;
         rrep.found = true;
         rrep.rep = found->rep;
-        THashDataUnlock(rdata);
+        DatasetUnlockData(rdata);
         return rrep;
     }
     return rrep;
@@ -764,16 +906,16 @@ static int DatasetLookupSha256(Dataset *set, const uint8_t *data, const uint32_t
         return -1;
 
     if (data_len != 32)
-        return 0;
+        return -1;
 
     Sha256Type lookup = { .rep.value = 0 };
     memcpy(lookup.sha256, data, data_len);
     THashData *rdata = THashLookupFromHash(set->hash, &lookup);
     if (rdata) {
-        THashDataUnlock(rdata);
+        DatasetUnlockData(rdata);
         return 1;
     }
-    return -1;
+    return 0;
 }
 
 static DataRepResultType DatasetLookupSha256wRep(Dataset *set,
@@ -794,12 +936,21 @@ static DataRepResultType DatasetLookupSha256wRep(Dataset *set,
         Sha256Type *found = rdata->data;
         rrep.found = true;
         rrep.rep = found->rep;
-        THashDataUnlock(rdata);
+        DatasetUnlockData(rdata);
         return rrep;
     }
     return rrep;
 }
 
+/**
+ *  \brief see if \a data is part of the set
+ *  \param set dataset
+ *  \param data data to look up
+ *  \param data_len length in bytes of \a data
+ *  \retval -1 error
+ *  \retval 0 not found
+ *  \retval 1 found
+ */
 int DatasetLookup(Dataset *set, const uint8_t *data, const uint32_t data_len)
 {
     if (set == NULL)
@@ -848,7 +999,7 @@ static int DatasetAddString(Dataset *set, const uint8_t *data, const uint32_t da
         .rep.value = 0 };
     struct THashDataGetResult res = THashGetFromHash(set->hash, &lookup);
     if (res.data) {
-        THashDataUnlock(res.data);
+        DatasetUnlockData(res.data);
         return res.is_new ? 1 : 0;
     }
     return -1;
@@ -869,7 +1020,7 @@ static int DatasetAddStringwRep(Dataset *set, const uint8_t *data, const uint32_
         .rep = *rep };
     struct THashDataGetResult res = THashGetFromHash(set->hash, &lookup);
     if (res.data) {
-        THashDataUnlock(res.data);
+        DatasetUnlockData(res.data);
         return res.is_new ? 1 : 0;
     }
     return -1;
@@ -881,13 +1032,13 @@ static int DatasetAddMd5(Dataset *set, const uint8_t *data, const uint32_t data_
         return -1;
 
     if (data_len != 16)
-        return -1;
+        return -2;
 
     Md5Type lookup = { .rep.value = 0 };
     memcpy(lookup.md5, data, 16);
     struct THashDataGetResult res = THashGetFromHash(set->hash, &lookup);
     if (res.data) {
-        THashDataUnlock(res.data);
+        DatasetUnlockData(res.data);
         return res.is_new ? 1 : 0;
     }
     return -1;
@@ -900,13 +1051,13 @@ static int DatasetAddMd5wRep(Dataset *set, const uint8_t *data, const uint32_t d
         return -1;
 
     if (data_len != 16)
-        return -1;
+        return -2;
 
     Md5Type lookup = { .rep = *rep };
     memcpy(lookup.md5, data, 16);
     struct THashDataGetResult res = THashGetFromHash(set->hash, &lookup);
     if (res.data) {
-        THashDataUnlock(res.data);
+        DatasetUnlockData(res.data);
         return res.is_new ? 1 : 0;
     }
     return -1;
@@ -919,13 +1070,13 @@ static int DatasetAddSha256wRep(Dataset *set, const uint8_t *data, const uint32_
         return -1;
 
     if (data_len != 32)
-        return 0;
+        return -2;
 
     Sha256Type lookup = { .rep = *rep };
     memcpy(lookup.sha256, data, 32);
     struct THashDataGetResult res = THashGetFromHash(set->hash, &lookup);
     if (res.data) {
-        THashDataUnlock(res.data);
+        DatasetUnlockData(res.data);
         return res.is_new ? 1 : 0;
     }
     return -1;
@@ -937,13 +1088,13 @@ static int DatasetAddSha256(Dataset *set, const uint8_t *data, const uint32_t da
         return -1;
 
     if (data_len != 32)
-        return 0;
+        return -2;
 
     Sha256Type lookup = { .rep.value = 0 };
     memcpy(lookup.sha256, data, 32);
     struct THashDataGetResult res = THashGetFromHash(set->hash, &lookup);
     if (res.data) {
-        THashDataUnlock(res.data);
+        DatasetUnlockData(res.data);
         return res.is_new ? 1 : 0;
     }
     return -1;
@@ -982,7 +1133,12 @@ static int DatasetAddwRep(Dataset *set, const uint8_t *data, const uint32_t data
     return -1;
 }
 
-/** \brief add serialized data to set */
+/** \brief add serialized data to set
+ *  \retval int 1 added
+ *  \retval int 0 already in hash
+ *  \retval int -1 API error (not added)
+ *  \retval int -2 DATA error
+ */
 int DatasetAddSerialized(Dataset *set, const char *string)
 {
     if (set == NULL)
@@ -990,29 +1146,112 @@ int DatasetAddSerialized(Dataset *set, const char *string)
 
     switch (set->type) {
         case DATASET_TYPE_STRING: {
+            // coverity[alloc_strlen : FALSE]
             uint8_t decoded[strlen(string)];
             uint32_t len = DecodeBase64(decoded, (const uint8_t *)string, strlen(string), 1);
             if (len == 0) {
-                return -1;
+                return -2;
             }
 
             return DatasetAddString(set, decoded, len);
         }
         case DATASET_TYPE_MD5: {
             if (strlen(string) != 32)
-                return -1;
+                return -2;
             uint8_t hash[16];
             if (HexToRaw((const uint8_t *)string, 32, hash, sizeof(hash)) < 0)
-                return -1;
+                return -2;
             return DatasetAddMd5(set, hash, 16);
         }
         case DATASET_TYPE_SHA256: {
             if (strlen(string) != 64)
-                return -1;
+                return -2;
             uint8_t hash[32];
             if (HexToRaw((const uint8_t *)string, 64, hash, sizeof(hash)) < 0)
-                return -1;
+                return -2;
             return DatasetAddSha256(set, hash, 32);
+        }
+    }
+    return -1;
+}
+
+/**
+ *  \retval 1 data was removed from the hash
+ *  \retval 0 data not removed (busy)
+ *  \retval -1 data not found
+ */
+static int DatasetRemoveString(Dataset *set, const uint8_t *data, const uint32_t data_len)
+{
+    if (set == NULL)
+        return -1;
+
+    StringType lookup = { .ptr = (uint8_t *)data, .len = data_len,
+        .rep.value = 0 };
+    return THashRemoveFromHash(set->hash, &lookup);
+}
+
+static int DatasetRemoveMd5(Dataset *set, const uint8_t *data, const uint32_t data_len)
+{
+    if (set == NULL)
+        return -1;
+
+    if (data_len != 16)
+        return -2;
+
+    Md5Type lookup = { .rep.value = 0 };
+    memcpy(lookup.md5, data, 16);
+    return THashRemoveFromHash(set->hash, &lookup);
+}
+
+static int DatasetRemoveSha256(Dataset *set, const uint8_t *data, const uint32_t data_len)
+{
+    if (set == NULL)
+        return -1;
+
+    if (data_len != 32)
+        return -2;
+
+    Sha256Type lookup = { .rep.value = 0 };
+    memcpy(lookup.sha256, data, 32);
+    return THashRemoveFromHash(set->hash, &lookup);
+}
+
+/** \brief remove serialized data from set
+ *  \retval int 1 removed
+ *  \retval int 0 found but busy (not removed)
+ *  \retval int -1 API error (not removed)
+ *  \retval int -2 DATA error */
+int DatasetRemoveSerialized(Dataset *set, const char *string)
+{
+    if (set == NULL)
+        return -1;
+
+    switch (set->type) {
+        case DATASET_TYPE_STRING: {
+            // coverity[alloc_strlen : FALSE]
+            uint8_t decoded[strlen(string)];
+            uint32_t len = DecodeBase64(decoded, (const uint8_t *)string, strlen(string), 1);
+            if (len == 0) {
+                return -2;
+            }
+
+            return DatasetRemoveString(set, decoded, len);
+        }
+        case DATASET_TYPE_MD5: {
+            if (strlen(string) != 32)
+                return -2;
+            uint8_t hash[16];
+            if (HexToRaw((const uint8_t *)string, 32, hash, sizeof(hash)) < 0)
+                return -2;
+            return DatasetRemoveMd5(set, hash, 16);
+        }
+        case DATASET_TYPE_SHA256: {
+            if (strlen(string) != 64)
+                return -2;
+            uint8_t hash[32];
+            if (HexToRaw((const uint8_t *)string, 64, hash, sizeof(hash)) < 0)
+                return -2;
+            return DatasetRemoveSha256(set, hash, 32);
         }
     }
     return -1;

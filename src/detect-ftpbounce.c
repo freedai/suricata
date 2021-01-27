@@ -52,14 +52,14 @@ static int DetectFtpbounceALMatch(DetectEngineThreadCtx *,
         const Signature *, const SigMatchCtx *);
 
 static int DetectFtpbounceSetup(DetectEngineCtx *, Signature *, const char *);
+#ifdef UNITTESTS
 static void DetectFtpbounceRegisterTests(void);
+#endif
 static int g_ftp_request_list_id = 0;
 
-static int InspectFtpRequest(ThreadVars *tv,
-        DetectEngineCtx *de_ctx, DetectEngineThreadCtx *det_ctx,
-        const Signature *s, const SigMatchData *smd,
-        Flow *f, uint8_t flags, void *alstate,
-        void *txv, uint64_t tx_id);
+static int InspectFtpRequest(DetectEngineCtx *de_ctx, DetectEngineThreadCtx *det_ctx,
+        const struct DetectEngineAppInspectionEngine_ *engine, const Signature *s, Flow *f,
+        uint8_t flags, void *alstate, void *txv, uint64_t tx_id);
 
 /**
  * \brief Registration function for ftpbounce: keyword
@@ -71,25 +71,24 @@ void DetectFtpbounceRegister(void)
     sigmatch_table[DETECT_FTPBOUNCE].desc = "detect FTP bounce attacks";
     sigmatch_table[DETECT_FTPBOUNCE].Setup = DetectFtpbounceSetup;
     sigmatch_table[DETECT_FTPBOUNCE].AppLayerTxMatch = DetectFtpbounceALMatch;
+#ifdef UNITTESTS
     sigmatch_table[DETECT_FTPBOUNCE].RegisterTests = DetectFtpbounceRegisterTests;
-    sigmatch_table[DETECT_FTPBOUNCE].url = DOC_URL DOC_VERSION "/rules/ftp-keywords.html#ftpbounce";
+#endif
+    sigmatch_table[DETECT_FTPBOUNCE].url = "/rules/ftp-keywords.html#ftpbounce";
     sigmatch_table[DETECT_FTPBOUNCE].flags = SIGMATCH_NOOPT;
 
     g_ftp_request_list_id = DetectBufferTypeRegister("ftp_request");
 
-    DetectAppLayerInspectEngineRegister("ftp_request",
-            ALPROTO_FTP, SIG_FLAG_TOSERVER, 0,
-            InspectFtpRequest);
+    DetectAppLayerInspectEngineRegister2(
+            "ftp_request", ALPROTO_FTP, SIG_FLAG_TOSERVER, 0, InspectFtpRequest, NULL);
 }
 
-static int InspectFtpRequest(ThreadVars *tv,
-        DetectEngineCtx *de_ctx, DetectEngineThreadCtx *det_ctx,
-        const Signature *s, const SigMatchData *smd,
-        Flow *f, uint8_t flags, void *alstate,
-        void *txv, uint64_t tx_id)
+static int InspectFtpRequest(DetectEngineCtx *de_ctx, DetectEngineThreadCtx *det_ctx,
+        const struct DetectEngineAppInspectionEngine_ *engine, const Signature *s, Flow *f,
+        uint8_t flags, void *alstate, void *txv, uint64_t tx_id)
 {
-    return DetectEngineInspectGenericList(tv, de_ctx, det_ctx, s, smd,
-                                          f, flags, alstate, txv, tx_id);
+    return DetectEngineInspectGenericList(
+            de_ctx, det_ctx, s, engine->smd, f, flags, alstate, txv, tx_id);
 }
 
 /**
@@ -269,7 +268,7 @@ static int DetectFtpbounceTestSetup01(void)
     FAIL_IF(s->sm_lists[g_ftp_request_list_id] == NULL);
     FAIL_IF_NOT(s->sm_lists[g_ftp_request_list_id]->type & DETECT_FTPBOUNCE);
 
-    SigFree(s);
+    SigFree(de_ctx, s);
     PASS;
 }
 
@@ -558,18 +557,15 @@ end:
     return result;
 }
 
-#endif /* UNITTESTS */
-
 /**
  * \brief this function registers unit tests for DetectFtpbounce
  */
-void DetectFtpbounceRegisterTests(void)
+static void DetectFtpbounceRegisterTests(void)
 {
-#ifdef UNITTESTS
     UtRegisterTest("DetectFtpbounceTestSetup01", DetectFtpbounceTestSetup01);
     UtRegisterTest("DetectFtpbounceTestALMatch02",
                    DetectFtpbounceTestALMatch02);
     UtRegisterTest("DetectFtpbounceTestALMatch03",
                    DetectFtpbounceTestALMatch03);
-#endif /* UNITTESTS */
 }
+#endif /* UNITTESTS */

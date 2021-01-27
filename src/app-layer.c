@@ -1,4 +1,4 @@
-/* Copyright (C) 2007-2011 Open Information Security Foundation
+/* Copyright (C) 2007-2020 Open Information Security Foundation
  *
  * You can copy, redistribute or modify this Program under the terms of
  * the GNU General Public License version 2 as published by the Free
@@ -48,7 +48,6 @@
 #include "decode-events.h"
 
 #include "app-layer-htp-mem.h"
-#include "app-layer-dns-common.h"
 
 /**
  * \brief This is for the app layer in general and it contains per thread
@@ -70,6 +69,8 @@ struct AppLayerThreadCtx_ {
     uint64_t proto_detect_ticks_spent;
 #endif
 };
+
+#define FLOW_PROTO_CHANGE_MAX_DEPTH 4096
 
 #define MAX_COUNTER_SIZE 64
 typedef struct AppLayerCounterNames_ {
@@ -199,16 +200,19 @@ static void DisableAppLayer(ThreadVars *tv, Flow *f, Packet *p)
 static void TCPProtoDetectCheckBailConditions(ThreadVars *tv,
         Flow *f, TcpSession *ssn, Packet *p)
 {
-    uint32_t size_ts = ssn->client.last_ack - ssn->client.isn - 1;
-    uint32_t size_tc = ssn->server.last_ack - ssn->server.isn - 1;
-    SCLogDebug("size_ts %u, size_tc %u", size_ts, size_tc);
+    if (ssn->state < TCP_ESTABLISHED) {
+        SCLogDebug("skip as long as TCP is not ESTABLISHED (TCP fast open)");
+        return;
+    }
 
-#ifdef DEBUG_VALIDATION
-    if (!(ssn->client.flags & STREAMTCP_STREAM_FLAG_GAP))
-        BUG_ON(size_ts > 1000000UL);
-    if (!(ssn->server.flags & STREAMTCP_STREAM_FLAG_GAP))
-        BUG_ON(size_tc > 1000000UL);
-#endif /* DEBUG_VALIDATION */
+    const uint64_t size_ts = STREAM_HAS_SEEN_DATA(&ssn->client) ?
+        STREAM_RIGHT_EDGE(&ssn->client) : 0;
+    const uint64_t size_tc = STREAM_HAS_SEEN_DATA(&ssn->server) ?
+        STREAM_RIGHT_EDGE(&ssn->server) : 0;
+    SCLogDebug("size_ts %"PRIu64", size_tc %"PRIu64, size_ts, size_tc);
+
+    DEBUG_VALIDATE_BUG_ON(size_ts > 1000000UL);
+    DEBUG_VALIDATE_BUG_ON(size_tc > 1000000UL);
 
     if (ProtoDetectDone(f, ssn, STREAM_TOSERVER) &&
         ProtoDetectDone(f, ssn, STREAM_TOCLIENT))
@@ -295,7 +299,10 @@ static int TCPProtoDetectTriggerOpposingSide(ThreadVars *tv,
     return ret;
 }
 
-/** \todo data const */
+/** \todo data const
+ *  \retval int -1 error
+ *  \retval int 0 ok
+ */
 static int TCPProtoDetect(ThreadVars *tv,
         TcpReassemblyThreadCtx *ra_ctx, AppLayerThreadCtx *app_tctx,
         Packet *p, Flow *f, TcpSession *ssn, TcpStream **stream,
@@ -303,6 +310,7 @@ static int TCPProtoDetect(ThreadVars *tv,
 {
     AppProto *alproto;
     AppProto *alproto_otherdir;
+    int direction = (flags & STREAM_TOSERVER) ? 0 : 1;
 
     if (flags & STREAM_TOSERVER) {
         alproto = &f->alproto_ts;
@@ -368,6 +376,7 @@ static int TCPProtoDetect(ThreadVars *tv,
             } else {
                 *stream = &ssn->client;
             }
+            direction = 1 - direction;
         }
 
         /* account flow if we have both sides */
@@ -392,7 +401,7 @@ static int TCPProtoDetect(ThreadVars *tv,
                         p, ssn, *stream) != 0)
             {
                 DisableAppLayer(tv, f, p);
-                goto failure;
+                SCReturnInt(-1);
             }
         }
 
@@ -420,7 +429,7 @@ static int TCPProtoDetect(ThreadVars *tv,
                 AppLayerDecoderEventsSetEventRaw(&p->app_layer_events,
                         APPLAYER_WRONG_DIRECTION_FIRST_DATA);
                 DisableAppLayer(tv, f, p);
-                goto failure;
+                SCReturnInt(-1);
             }
             /* This can happen if the current direction is not the
              * right direction, and the data from the other(also
@@ -435,7 +444,7 @@ static int TCPProtoDetect(ThreadVars *tv,
                 FLOW_RESET_PP_DONE(f, flags);
                 FLOW_RESET_PM_DONE(f, flags);
                 FLOW_RESET_PE_DONE(f, flags);
-                goto failure;
+                SCReturnInt(-1);
             }
         }
 
@@ -447,10 +456,11 @@ static int TCPProtoDetect(ThreadVars *tv,
         int r = AppLayerParserParse(tv, app_tctx->alp_tctx, f, f->alproto,
                 flags, data, data_len);
         PACKET_PROFILING_APP_END(app_tctx, f->alproto);
-        if (r < 0)
-            goto failure;
-        (*stream)->app_progress_rel += data_len;
-
+        if (r < 0) {
+            SCReturnInt(-1);
+        } else if (r == 0) {
+            StreamTcpUpdateAppLayerProgress(ssn, direction, data_len);
+        }
     } else {
         /* if the ssn is midstream, we may end up with a case where the
          * start of an HTTP request is missing. We won't detect HTTP based
@@ -473,7 +483,7 @@ static int TCPProtoDetect(ThreadVars *tv,
                 SCLogDebug("midstream end pd %p", ssn);
                 /* midstream and toserver detection failed: give up */
                 DisableAppLayer(tv, f, p);
-                goto end;
+                SCReturnInt(0);
             }
         }
 
@@ -500,7 +510,7 @@ static int TCPProtoDetect(ThreadVars *tv,
                     (first_data_dir) && !(first_data_dir & flags))
             {
                 DisableAppLayer(tv, f, p);
-                goto failure;
+                SCReturnInt(-1);
             }
 
             /* if protocol detection is marked done for our direction we
@@ -519,8 +529,8 @@ static int TCPProtoDetect(ThreadVars *tv,
                             f->alproto, flags,
                             data, data_len);
                     PACKET_PROFILING_APP_END(app_tctx, f->alproto);
-                    if (r >= 0) {
-                        (*stream)->app_progress_rel += data_len;
+                    if (r == 0) {
+                        StreamTcpUpdateAppLayerProgress(ssn, direction, data_len);
                     }
 
                     AppLayerDecoderEventsSetEventRaw(&p->app_layer_events,
@@ -531,8 +541,9 @@ static int TCPProtoDetect(ThreadVars *tv,
                     *alproto = *alproto_otherdir;
                     SCLogDebug("packet %"PRIu64": pd done(us %u them %u), parser called (r==%d), APPLAYER_DETECT_PROTOCOL_ONLY_ONE_DIRECTION set",
                             p->pcap_cnt, *alproto, *alproto_otherdir, r);
-                    if (r < 0)
-                        goto failure;
+                    if (r < 0) {
+                        SCReturnInt(-1);
+                    }
                 }
                 *alproto = ALPROTO_FAILED;
                 StreamTcpSetStreamFlagAppProtoDetectionCompleted(*stream);
@@ -542,14 +553,21 @@ static int TCPProtoDetect(ThreadVars *tv,
             }
         } else {
             /* both sides unknown, let's see if we need to give up */
-            TCPProtoDetectCheckBailConditions(tv, f, ssn, p);
+            if (FlowChangeProto(f)) {
+                /* TCPProtoDetectCheckBailConditions does not work well because
+                 * size_tc from STREAM_RIGHT_EDGE is not reset to zero
+                 * so, we set a lower limit to the data we inspect
+                 * We could instead have set ssn->server.sb.stream_offset = 0;
+                 */
+                if (data_len >= FLOW_PROTO_CHANGE_MAX_DEPTH || (flags & STREAM_EOF)) {
+                    DisableAppLayer(tv, f, p);
+                }
+            } else {
+                TCPProtoDetectCheckBailConditions(tv, f, ssn, p);
+            }
         }
     }
-end:
-    return 0;
-
-failure:
-    return -1;
+    SCReturnInt(0);
 }
 
 /** \brief handle TCP data for the app-layer.
@@ -569,6 +587,7 @@ int AppLayerHandleTCPData(ThreadVars *tv, TcpReassemblyThreadCtx *ra_ctx,
     SCEnter();
 
     DEBUG_ASSERT_FLOW_LOCKED(f);
+    DEBUG_VALIDATE_BUG_ON(data_len > (uint32_t)INT_MAX);
 
     AppLayerThreadCtx *app_tctx = ra_ctx->app_tctx;
     AppProto alproto;
@@ -579,6 +598,8 @@ int AppLayerHandleTCPData(ThreadVars *tv, TcpReassemblyThreadCtx *ra_ctx,
         SCLogDebug("STREAMTCP_FLAG_APP_LAYER_DISABLED is set");
         goto end;
     }
+
+    const int direction = (flags & STREAM_TOSERVER) ? 0 : 1;
 
     if (flags & STREAM_TOSERVER) {
         alproto = f->alproto_ts;
@@ -597,12 +618,17 @@ int AppLayerHandleTCPData(ThreadVars *tv, TcpReassemblyThreadCtx *ra_ctx,
                 goto failure;
             }
         }
+        if (FlowChangeProto(f)) {
+            FlowUnsetChangeProtoFlag(f);
+            SCLogDebug("Cannot handle gap while changing protocol");
+            goto failure;
+        }
         PACKET_PROFILING_APP_START(app_tctx, f->alproto);
         r = AppLayerParserParse(tv, app_tctx->alp_tctx, f, f->alproto,
                 flags, data, data_len);
         PACKET_PROFILING_APP_END(app_tctx, f->alproto);
         /* ignore parser result for gap */
-        (*stream)->app_progress_rel += data_len;
+        StreamTcpUpdateAppLayerProgress(ssn, direction, data_len);
         goto end;
     }
 
@@ -611,18 +637,38 @@ int AppLayerHandleTCPData(ThreadVars *tv, TcpReassemblyThreadCtx *ra_ctx,
      * We receive 2 stream init msgs (one for each direction) but we
      * only run the proto detection once. */
     if (alproto == ALPROTO_UNKNOWN && (flags & STREAM_START)) {
+        DEBUG_VALIDATE_BUG_ON(FlowChangeProto(f));
         /* run protocol detection */
         if (TCPProtoDetect(tv, ra_ctx, app_tctx, p, f, ssn, stream,
                            data, data_len, flags) != 0) {
             goto failure;
         }
     } else if (alproto != ALPROTO_UNKNOWN && FlowChangeProto(f)) {
-        f->alproto_orig = f->alproto;
         SCLogDebug("protocol change, old %s", AppProtoToString(f->alproto_orig));
+        void *alstate_orig = f->alstate;
+        AppLayerParserState *alparser = f->alparser;
+        // we delay AppLayerParserStateCleanup because we may need previous parser state
         AppLayerProtoDetectReset(f);
+        StreamTcpResetStreamFlagAppProtoDetectionCompleted(&ssn->client);
+        StreamTcpResetStreamFlagAppProtoDetectionCompleted(&ssn->server);
         /* rerun protocol detection */
-        if (TCPProtoDetect(tv, ra_ctx, app_tctx, p, f, ssn, stream,
-                           data, data_len, flags) != 0) {
+        int rd = TCPProtoDetect(tv, ra_ctx, app_tctx, p, f, ssn, stream, data, data_len, flags);
+        if (f->alproto == ALPROTO_UNKNOWN) {
+            DEBUG_VALIDATE_BUG_ON(alstate_orig != f->alstate);
+            // not enough data, revert AppLayerProtoDetectReset to rerun detection
+            f->alparser = alparser;
+            f->alproto = f->alproto_orig;
+            f->alproto_tc = f->alproto_orig;
+            f->alproto_ts = f->alproto_orig;
+        } else {
+            FlowUnsetChangeProtoFlag(f);
+            AppLayerParserStateProtoCleanup(f->protomap, f->alproto_orig, alstate_orig, alparser);
+            if (alstate_orig == f->alstate) {
+                // we just freed it
+                f->alstate = NULL;
+            }
+        }
+        if (rd != 0) {
             SCLogDebug("proto detect failure");
             goto failure;
         }
@@ -660,8 +706,8 @@ int AppLayerHandleTCPData(ThreadVars *tv, TcpReassemblyThreadCtx *ra_ctx,
             r = AppLayerParserParse(tv, app_tctx->alp_tctx, f, f->alproto,
                                     flags, data, data_len);
             PACKET_PROFILING_APP_END(app_tctx, f->alproto);
-            if (r >= 0) {
-                (*stream)->app_progress_rel += data_len;
+            if (r == 0) {
+                StreamTcpUpdateAppLayerProgress(ssn, direction, data_len);
             }
         }
     }
@@ -972,8 +1018,8 @@ void AppLayerDeSetupCounters()
     ThreadVars tv;\
     StreamTcpThread *stt = NULL;\
     TCPHdr tcph;\
-    PacketQueue pq;\
-    memset(&pq,0,sizeof(PacketQueue));\
+    PacketQueueNoLock pq;\
+    memset(&pq,0,sizeof(PacketQueueNoLock));\
     memset(p, 0, SIZE_OF_PACKET);\
     memset (&f, 0, sizeof(Flow));\
     memset(&tv, 0, sizeof (ThreadVars));\

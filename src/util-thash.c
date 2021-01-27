@@ -189,8 +189,6 @@ static void THashDataFree(THashTableContext *ctx, THashData *h)
         if (h->data != NULL) {
             ctx->config.DataFree(h->data);
         }
-
-        SC_ATOMIC_DESTROY(h->use_cnt);
         SCMutexDestroy(&h->m);
         SCFree(h);
         (void) SC_ATOMIC_SUB(ctx->memuse, THASH_DATA_SIZE(ctx));
@@ -206,7 +204,7 @@ static void THashDataFree(THashTableContext *ctx, THashData *h)
 
 /** \brief initialize the configuration
  *  \warning Not thread safe */
-static void THashInitConfig(THashTableContext *ctx, const char *cnf_prefix)
+static int THashInitConfig(THashTableContext *ctx, const char *cnf_prefix)
 {
     char varname[256];
 
@@ -224,22 +222,22 @@ static void THashInitConfig(THashTableContext *ctx, const char *cnf_prefix)
             SCLogError(SC_ERR_SIZE_PARSE, "Error parsing %s "
                        "from conf file - %s.  Killing engine",
                        varname, conf_val);
-            exit(EXIT_FAILURE);
+            return -1;
         }
     }
     GET_VAR(cnf_prefix, "hash-size");
     if ((ConfGet(varname, &conf_val)) == 1)
     {
-        if (ByteExtractStringUint32(&configval, 10, strlen(conf_val),
+        if (StringParseUint32(&configval, 10, strlen(conf_val),
                                     conf_val) > 0) {
             ctx->config.hash_size = configval;
         }
     }
 
-    GET_VAR(cnf_prefix, "hash-size");
+    GET_VAR(cnf_prefix, "prealloc");
     if ((ConfGet(varname, &conf_val)) == 1)
     {
-        if (ByteExtractStringUint32(&configval, 10, strlen(conf_val),
+        if (StringParseUint32(&configval, 10, strlen(conf_val),
                                     conf_val) > 0) {
             ctx->config.prealloc = configval;
         } else {
@@ -256,12 +254,12 @@ static void THashInitConfig(THashTableContext *ctx, const char *cnf_prefix)
                 "total hash size by multiplying \"hash-size\" with %"PRIuMAX", "
                 "which is the hash bucket size.", ctx->config.memcap, hash_size,
                 (uintmax_t)sizeof(THashHashRow));
-        exit(EXIT_FAILURE);
+        return -1;
     }
     ctx->array = SCMallocAligned(ctx->config.hash_size * sizeof(THashHashRow), CLS);
     if (unlikely(ctx->array == NULL)) {
-        SCLogError(SC_ERR_FATAL, "Fatal error encountered in THashInitConfig. Exiting...");
-        exit(EXIT_FAILURE);
+        SCLogError(SC_ERR_THASH_INIT, "Fatal error encountered in THashInitConfig. Exiting...");
+        return -1;
     }
     memset(ctx->array, 0, ctx->config.hash_size * sizeof(THashHashRow));
 
@@ -278,25 +276,23 @@ static void THashInitConfig(THashTableContext *ctx, const char *cnf_prefix)
                     "max thash memcap reached. Memcap %"PRIu64", "
                     "Memuse %"PRIu64".", ctx->config.memcap,
                     ((uint64_t)SC_ATOMIC_GET(ctx->memuse) + THASH_DATA_SIZE(ctx)));
-            exit(EXIT_FAILURE);
+            return -1;
         }
 
         THashData *h = THashDataAlloc(ctx);
         if (h == NULL) {
             SCLogError(SC_ERR_THASH_INIT, "preallocating data failed: %s", strerror(errno));
-            exit(EXIT_FAILURE);
+            return -1;
         }
         THashDataEnqueue(&ctx->spare_q,h);
     }
 
-    return;
+    return 0;
 }
 
-THashTableContext* THashInit(const char *cnf_prefix, size_t data_size,
-    int (*DataSet)(void *, void *),
-     void (*DataFree)(void *),
-     uint32_t (*DataHash)(void *),
-     _Bool (*DataCompare)(void *, void *))
+THashTableContext *THashInit(const char *cnf_prefix, size_t data_size,
+        int (*DataSet)(void *, void *), void (*DataFree)(void *), uint32_t (*DataHash)(void *),
+        bool (*DataCompare)(void *, void *), bool reset_memcap, uint64_t memcap, uint32_t hashsize)
 {
     THashTableContext *ctx = SCCalloc(1, sizeof(*ctx));
     BUG_ON(!ctx);
@@ -309,8 +305,19 @@ THashTableContext* THashInit(const char *cnf_prefix, size_t data_size,
 
     /* set defaults */
     ctx->config.hash_rand = (uint32_t)RandomGet();
-    ctx->config.hash_size = THASH_DEFAULT_HASHSIZE;
+    ctx->config.hash_size = hashsize > 0 ? hashsize : THASH_DEFAULT_HASHSIZE;
+    /* Reset memcap in case of loading from file to the highest possible value
+     unless defined by the rule keyword */
+#ifdef FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION
+    // limit memcap size to default when fuzzing
     ctx->config.memcap = THASH_DEFAULT_MEMCAP;
+#else
+    if (memcap > 0) {
+        ctx->config.memcap = memcap;
+    } else {
+        ctx->config.memcap = reset_memcap ? UINT64_MAX : THASH_DEFAULT_MEMCAP;
+    }
+#endif
     ctx->config.prealloc = THASH_DEFAULT_PREALLOC;
 
     SC_ATOMIC_INIT(ctx->counter);
@@ -318,8 +325,19 @@ THashTableContext* THashInit(const char *cnf_prefix, size_t data_size,
     SC_ATOMIC_INIT(ctx->prune_idx);
     THashDataQueueInit(&ctx->spare_q);
 
-    THashInitConfig(ctx, cnf_prefix);
+    if (THashInitConfig(ctx, cnf_prefix) < 0) {
+        THashShutdown(ctx);
+        ctx = NULL;
+    }
     return ctx;
+}
+
+/* \brief Set memcap to current memuse
+ * */
+void THashConsolidateMemcap(THashTableContext *ctx)
+{
+    ctx->config.memcap = MAX(SC_ATOMIC_GET(ctx->memuse), THASH_DEFAULT_MEMCAP);
+    SCLogDebug("memcap after load set to: %" PRIu64, ctx->config.memcap);
 }
 
 /** \brief shutdown the flow engine
@@ -352,11 +370,6 @@ void THashShutdown(THashTableContext *ctx)
     }
     (void) SC_ATOMIC_SUB(ctx->memuse, ctx->config.hash_size * sizeof(THashHashRow));
     THashDataQueueDestroy(&ctx->spare_q);
-
-    SC_ATOMIC_DESTROY(ctx->prune_idx);
-    SC_ATOMIC_DESTROY(ctx->memuse);
-    SC_ATOMIC_DESTROY(ctx->counter);
-
     SCFree(ctx);
     return;
 }
@@ -480,6 +493,10 @@ static THashData *THashDataGetNew(THashTableContext *ctx, void *data)
                 return NULL;
             }
 
+            if (!SC_ATOMIC_GET(ctx->memcap_reached)) {
+                SC_ATOMIC_SET(ctx->memcap_reached, true);
+            }
+
             /* freed data, but it's unlocked */
         } else {
             /* now see if we can alloc a new data */
@@ -597,6 +614,7 @@ THashGetFromHash (THashTableContext *ctx, void *data)
                 HRLOCK_UNLOCK(hb);
                 res.data = h;
                 res.is_new = false;
+                /* coverity[missing_unlock : FALSE] */
                 return res;
             }
         }
@@ -608,6 +626,7 @@ THashGetFromHash (THashTableContext *ctx, void *data)
     HRLOCK_UNLOCK(hb);
     res.data = h;
     res.is_new = false;
+    /* coverity[missing_unlock : FALSE] */
     return res;
 }
 
@@ -736,6 +755,9 @@ static THashData *THashGetUsed(THashTableContext *ctx)
         h->prev = NULL;
         HRLOCK_UNLOCK(hb);
 
+        if (h->data != NULL) {
+            ctx->config.DataFree(h->data);
+        }
         SCMutexUnlock(&h->m);
 
         (void) SC_ATOMIC_ADD(ctx->prune_idx, (ctx->config.hash_size - cnt));
@@ -743,4 +765,55 @@ static THashData *THashGetUsed(THashTableContext *ctx)
     }
 
     return NULL;
+}
+
+/**
+ * \retval int -1 not found
+ * \retval int 0 found, but it was busy (ref cnt)
+ * \retval int 1 found and removed */
+int THashRemoveFromHash (THashTableContext *ctx, void *data)
+{
+    /* get the key to our bucket */
+    uint32_t key = THashGetKey(&ctx->config, data);
+    /* get our hash bucket and lock it */
+    THashHashRow *hb = &ctx->array[key];
+
+    HRLOCK_LOCK(hb);
+    THashData *h = hb->head;
+    while (h != NULL) {
+        /* see if this is the data we are looking for */
+        if (THashCompare(&ctx->config, h->data, data) == 0) {
+            h = h->next;
+            continue;
+        }
+
+        SCMutexLock(&h->m);
+        if (SC_ATOMIC_GET(h->use_cnt) > 0) {
+            SCMutexUnlock(&h->m);
+            HRLOCK_UNLOCK(hb);
+            return 0;
+        }
+
+        /* remove from the hash */
+        if (h->prev != NULL)
+            h->prev->next = h->next;
+        if (h->next != NULL)
+            h->next->prev = h->prev;
+        if (hb->head == h)
+            hb->head = h->next;
+        if (hb->tail == h)
+            hb->tail = h->prev;
+
+        h->next = NULL;
+        h->prev = NULL;
+        SCMutexUnlock(&h->m);
+        HRLOCK_UNLOCK(hb);
+        THashDataFree(ctx, h);
+        SCLogDebug("found and removed");
+        return 1;
+    }
+
+    HRLOCK_UNLOCK(hb);
+    SCLogDebug("data not found");
+    return -1;
 }

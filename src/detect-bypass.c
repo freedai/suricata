@@ -53,7 +53,9 @@
 static int DetectBypassMatch(DetectEngineThreadCtx *, Packet *,
         const Signature *, const SigMatchCtx *);
 static int DetectBypassSetup(DetectEngineCtx *, Signature *, const char *);
+#ifdef UNITTESTS
 static void DetectBypassRegisterTests(void);
+#endif
 
 /**
  * \brief Registration function for keyword: bypass
@@ -62,11 +64,13 @@ void DetectBypassRegister(void)
 {
     sigmatch_table[DETECT_BYPASS].name = "bypass";
     sigmatch_table[DETECT_BYPASS].desc = "call the bypass callback when the match of a sig is complete";
-    sigmatch_table[DETECT_BYPASS].url = DOC_URL DOC_VERSION "/rules/bypass-keyword.html";
+    sigmatch_table[DETECT_BYPASS].url = "/rules/bypass-keyword.html";
     sigmatch_table[DETECT_BYPASS].Match = DetectBypassMatch;
     sigmatch_table[DETECT_BYPASS].Setup = DetectBypassSetup;
     sigmatch_table[DETECT_BYPASS].Free  = NULL;
+#ifdef UNITTESTS
     sigmatch_table[DETECT_BYPASS].RegisterTests = DetectBypassRegisterTests;
+#endif
     sigmatch_table[DETECT_BYPASS].flags = SIGMATCH_NOOPT;
 }
 
@@ -232,11 +236,9 @@ static int DetectBypassTestSig01(void)
     SCFree(livedev);
     PASS;
 }
-#endif /* UNITTESTS */
 
 static void DetectBypassRegisterTests(void)
 {
-#ifdef UNITTESTS
     UtRegisterTest("DetectBypassTestSig01", DetectBypassTestSig01);
-#endif /* UNITTESTS */
 }
+#endif /* UNITTESTS */

@@ -1,6 +1,9 @@
 Suricata
 ========
 
+[![Fuzzing Status](https://oss-fuzz-build-logs.storage.googleapis.com/badges/suricata.svg)](https://bugs.chromium.org/p/oss-fuzz/issues/list?sort=-opened&can=1&q=proj:suricata)
+[![codecov](https://codecov.io/gh/OISF/suricata/branch/master/graph/badge.svg?token=QRyyn2BSo1)](https://codecov.io/gh/OISF/suricata)
+
 Introduction
 ------------
 
@@ -64,7 +67,7 @@ Next to these tests, based on the type of code change further tests can be run m
 
 - traffic replay testing (multi-gigabit)
 - large pcap collection processing (multi-terabytes)
-- AFL based fuzz testing (might take multiple days or even weeks)
+- fuzz testing (might take multiple days or even weeks)
 - pcap based performance testing
 - live performance testing
 - various other manual tests based on evaluation of the proposed changes

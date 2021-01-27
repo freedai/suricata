@@ -57,8 +57,10 @@
 
 /* prototypes */
 static int DetectUricontentSetup (DetectEngineCtx *, Signature *, const char *);
+#ifdef UNITTESTS
 static void DetectUricontentRegisterTests(void);
-static void DetectUricontentFree(void *);
+#endif
+static void DetectUricontentFree(DetectEngineCtx *de_ctx, void *);
 
 static int g_http_uri_buffer_id = 0;
 
@@ -69,11 +71,13 @@ void DetectUricontentRegister (void)
 {
     sigmatch_table[DETECT_URICONTENT].name = "uricontent";
     sigmatch_table[DETECT_URICONTENT].desc = "legacy keyword to match on the request URI buffer";
-    sigmatch_table[DETECT_URICONTENT].url = DOC_URL DOC_VERSION "/rules/http-keywords.html#uricontent";
+    sigmatch_table[DETECT_URICONTENT].url = "/rules/http-keywords.html#uricontent";
     sigmatch_table[DETECT_URICONTENT].Match = NULL;
     sigmatch_table[DETECT_URICONTENT].Setup = DetectUricontentSetup;
     sigmatch_table[DETECT_URICONTENT].Free  = DetectUricontentFree;
+#ifdef UNITTESTS
     sigmatch_table[DETECT_URICONTENT].RegisterTests = DetectUricontentRegisterTests;
+#endif
     sigmatch_table[DETECT_URICONTENT].flags = (SIGMATCH_QUOTES_MANDATORY|SIGMATCH_HANDLE_NEGATION);
     sigmatch_table[DETECT_URICONTENT].alternative = DETECT_HTTP_URI;
 
@@ -85,7 +89,7 @@ void DetectUricontentRegister (void)
  *
  * \param cd pointer to DetectUricotentData
  */
-void DetectUricontentFree(void *ptr)
+void DetectUricontentFree(DetectEngineCtx *de_ctx, void *ptr)
 {
     SCEnter();
     DetectContentData *cd = (DetectContentData *)ptr;
@@ -1746,11 +1750,8 @@ static int DetectUricontentIsdataatParseTest(void)
     PASS;
 }
 
-#endif /* UNITTESTS */
-
 static void DetectUricontentRegisterTests(void)
 {
-#ifdef UNITTESTS
     UtRegisterTest("HTTPUriTest01", HTTPUriTest01);
     UtRegisterTest("HTTPUriTest02", HTTPUriTest02);
     UtRegisterTest("HTTPUriTest03", HTTPUriTest03);
@@ -1784,5 +1785,5 @@ static void DetectUricontentRegisterTests(void)
 
     UtRegisterTest("DetectUricontentIsdataatParseTest",
             DetectUricontentIsdataatParseTest);
-#endif /* UNITTESTS */
 }
+#endif /* UNITTESTS */

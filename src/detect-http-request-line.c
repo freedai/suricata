@@ -61,7 +61,9 @@
 #include "detect-http-request-line.h"
 
 static int DetectHttpRequestLineSetup(DetectEngineCtx *, Signature *, const char *);
+#ifdef UNITTESTS
 static void DetectHttpRequestLineRegisterTests(void);
+#endif
 static InspectionBuffer *GetData(DetectEngineThreadCtx *det_ctx,
         const DetectEngineTransforms *transforms,
         Flow *_f, const uint8_t _flow_flags,
@@ -76,11 +78,12 @@ void DetectHttpRequestLineRegister(void)
     sigmatch_table[DETECT_AL_HTTP_REQUEST_LINE].name = "http.request_line";
     sigmatch_table[DETECT_AL_HTTP_REQUEST_LINE].alias = "http_request_line";
     sigmatch_table[DETECT_AL_HTTP_REQUEST_LINE].desc = "sticky buffer to match on the HTTP request line";
-    sigmatch_table[DETECT_AL_HTTP_REQUEST_LINE].url = DOC_URL DOC_VERSION "/rules/http-keywords.html#http-request-line";
+    sigmatch_table[DETECT_AL_HTTP_REQUEST_LINE].url = "/rules/http-keywords.html#http-request-line";
     sigmatch_table[DETECT_AL_HTTP_REQUEST_LINE].Match = NULL;
     sigmatch_table[DETECT_AL_HTTP_REQUEST_LINE].Setup = DetectHttpRequestLineSetup;
+#ifdef UNITTESTS
     sigmatch_table[DETECT_AL_HTTP_REQUEST_LINE].RegisterTests = DetectHttpRequestLineRegisterTests;
-
+#endif
     sigmatch_table[DETECT_AL_HTTP_REQUEST_LINE].flags |= SIGMATCH_NOOPT|SIGMATCH_INFO_STICKY_BUFFER;
 
     DetectAppLayerInspectEngineRegister2("http_request_line",
@@ -326,18 +329,13 @@ static int DetectHttpRequestLineTest03(void)
     PASS;
 }
 
-#endif /* UNITTESTS */
-
 static void DetectHttpRequestLineRegisterTests(void)
 {
-#ifdef UNITTESTS
     UtRegisterTest("DetectHttpRequestLineTest01", DetectHttpRequestLineTest01);
     UtRegisterTest("DetectHttpRequestLineTest02", DetectHttpRequestLineTest02);
     UtRegisterTest("DetectHttpRequestLineTest03", DetectHttpRequestLineTest03);
-#endif /* UNITTESTS */
-
-    return;
 }
+#endif /* UNITTESTS */
 /**
  * @}
  */

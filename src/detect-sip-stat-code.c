@@ -54,7 +54,6 @@
 
 #include "rust.h"
 #include "app-layer-sip.h"
-#include "rust-sip-detect-gen.h"
 
 #define KEYWORD_NAME "sip.stat_code"
 #define KEYWORD_DOC  "sip-keywords.html#sip-stat-code"
@@ -101,7 +100,7 @@ void DetectSipStatCodeRegister (void)
     /* sip.stat_code sticky buffer */
     sigmatch_table[DETECT_AL_SIP_STAT_CODE].name = KEYWORD_NAME;
     sigmatch_table[DETECT_AL_SIP_STAT_CODE].desc = "sticky buffer to match on the SIP status code";
-    sigmatch_table[DETECT_AL_SIP_STAT_CODE].url = DOC_URL DOC_VERSION "/rules/" KEYWORD_DOC;
+    sigmatch_table[DETECT_AL_SIP_STAT_CODE].url = "/rules/" KEYWORD_DOC;
     sigmatch_table[DETECT_AL_SIP_STAT_CODE].Setup = DetectSipStatCodeSetup;
     sigmatch_table[DETECT_AL_SIP_STAT_CODE].flags |= SIGMATCH_NOOPT;
 

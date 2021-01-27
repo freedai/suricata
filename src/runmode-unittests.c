@@ -21,7 +21,6 @@
  */
 
 #include "suricata-common.h"
-#include "config.h"
 #include "util-unittest.h"
 #include "runmode-unittests.h"
 
@@ -92,12 +91,11 @@
 #include "util-pool.h"
 #include "util-byte.h"
 #include "util-proto-name.h"
+#include "util-macset.h"
 #include "util-memrchr.h"
 
 #include "util-mpm-ac.h"
 #include "util-mpm-hs.h"
-
-#include "util-decode-asn1.h"
 
 #include "conf.h"
 #include "conf-yaml-loader.h"
@@ -114,11 +112,6 @@
 
 #ifdef WINDIVERT
 #include "source-windivert.h"
-#endif
-
-#ifdef HAVE_NSS
-#include <prinit.h>
-#include <nss.h>
 #endif
 
 #endif /* UNITTESTS */
@@ -146,8 +139,10 @@ static void RegisterUnittests(void)
     IPPairBitRegisterTests();
     StatsRegisterTests();
     DecodeEthernetRegisterTests();
+    DecodeCHDLCRegisterTests();
     DecodePPPRegisterTests();
     DecodeVLANRegisterTests();
+    DecodeGeneveRegisterTests();
     DecodeVXLANRegisterTests();
     DecodeRawRegisterTests();
     DecodePPPOERegisterTests();
@@ -158,8 +153,9 @@ static void RegisterUnittests(void)
     DecodeTCPRegisterTests();
     DecodeUDPV4RegisterTests();
     DecodeGRERegisterTests();
-    DecodeAsn1RegisterTests();
+    DecodeESPRegisterTests();
     DecodeMPLSRegisterTests();
+    DecodeNSHRegisterTests();
     AppLayerProtoDetectUnittestsRegister();
     ConfRegisterTests();
     ConfYamlRegisterTests();
@@ -200,6 +196,7 @@ static void RegisterUnittests(void)
     AppLayerUnittestsRegister();
     MimeDecRegisterTests();
     StreamingBufferRegisterTests();
+    MacSetRegisterTests();
 #ifdef OS_WIN32
     Win32SyscallRegisterTests();
 #endif
@@ -244,9 +241,6 @@ void RunUnittests(int list_unittests, const char *regex_arg)
 
     CIDRInit();
 
-#ifdef DBG_MEM_ALLOC
-    SCLogInfo("Memory used at startup: %"PRIdMAX, (intmax_t)global_mem);
-#endif
     SCProtoNameInit();
 
     TagInitCtx();
@@ -265,13 +259,6 @@ void RunUnittests(int list_unittests, const char *regex_arg)
         regex_arg = ".*";
         UtRunSelftest(regex_arg); /* inits and cleans up again */
     }
-
-#ifdef HAVE_NSS
-    /* init NSS for hashing */
-    PR_Init(PR_USER_THREAD, PR_PRIORITY_NORMAL, 0);
-    NSS_NoDB_Init(NULL);
-#endif
-
 
     AppLayerHtpEnableRequestBodyCallback();
     AppLayerHtpNeedFileInspection();
@@ -300,14 +287,9 @@ void RunUnittests(int list_unittests, const char *regex_arg)
 #ifdef HAVE_LUAJIT
     LuajitFreeStatesPool();
 #endif
-#ifdef DBG_MEM_ALLOC
-    SCLogInfo("Total memory used (without SCFree()): %"PRIdMAX, (intmax_t)global_mem);
-#endif
 
     exit(EXIT_SUCCESS);
 #else
-    SCLogError(SC_ERR_NOT_SUPPORTED, "Unittests are not build-in");
-    exit(EXIT_FAILURE);
+    FatalError(SC_ERR_FATAL, "Unittests are not build-in");
 #endif /* UNITTESTS */
 }
-

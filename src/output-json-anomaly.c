@@ -1,4 +1,4 @@
-/* Copyright (C) 2019 Open Information Security Foundation
+/* Copyright (C) 2019-2020 Open Information Security Foundation
  *
  * You can copy, redistribute or modify this Program under the terms of
  * the GNU General Public License version 2 as published by the Free
@@ -84,17 +84,35 @@ typedef struct JsonAnomalyLogThread_ {
     AnomalyJsonOutputCtx* json_output_ctx;
 } JsonAnomalyLogThread;
 
+/*
+ * Restrict the anomaly logger count due to decoder state maintenance issues
+ */
+
+#define MAX_ANOMALY_LOGGERS 1
+static int anomaly_loggers = 0;
+static bool OutputAnomalyLoggerEnable(void)
+{
+    if (anomaly_loggers < MAX_ANOMALY_LOGGERS) {
+        anomaly_loggers++;
+        return true;
+    }
+    return false;
+}
+
+static void OutputAnomalyLoggerDisable(void)
+{
+    if (anomaly_loggers)
+        anomaly_loggers--;
+}
+
 static int AnomalyDecodeEventJson(ThreadVars *tv, JsonAnomalyLogThread *aft,
                                   const Packet *p)
 {
-    bool is_ip_pkt = PKT_IS_IPV4(p) || PKT_IS_IPV6(p);
+    const bool is_ip_pkt = PKT_IS_IPV4(p) || PKT_IS_IPV6(p);
+    const uint16_t log_type = aft->json_output_ctx->flags;
+    const bool log_stream = log_type & LOG_JSON_STREAM_TYPE;
+    const bool log_decode = log_type & LOG_JSON_DECODE_TYPE;
 
-    char timebuf[64];
-    CreateIsoTimeString(&p->ts, timebuf, sizeof(timebuf));
-
-    uint16_t log_type = aft->json_output_ctx->flags;
-    bool log_stream = log_type & LOG_JSON_STREAM_TYPE;
-    bool log_decode = log_type & LOG_JSON_DECODE_TYPE;
     for (int i = 0; i < p->events.cnt; i++) {
         uint8_t event_code = p->events.events[i];
         bool is_decode = EVENT_IS_DECODER_PACKET_ERROR(event_code);
@@ -105,45 +123,39 @@ static int AnomalyDecodeEventJson(ThreadVars *tv, JsonAnomalyLogThread *aft,
 
         MemBufferReset(aft->json_buffer);
 
-        json_t *js = CreateJSONHeader(p, LOG_DIR_PACKET, ANOMALY_EVENT_TYPE);
-
+        JsonBuilder *js = CreateEveHeader(p, LOG_DIR_PACKET, ANOMALY_EVENT_TYPE, NULL);
         if (unlikely(js == NULL)) {
             return TM_ECODE_OK;
         }
 
-        json_t *ajs = json_object();
-        if (unlikely(ajs == NULL)) {
-            json_decref(js);
-            return TM_ECODE_OK;
+        if (is_ip_pkt) {
+            EveAddCommonOptions(&aft->json_output_ctx->cfg, p, p->flow, js);
         }
 
-        if (!is_ip_pkt) {
-            json_object_set_new(js, "timestamp", json_string(timebuf));
-        } else {
-            JsonAddCommonOptions(&aft->json_output_ctx->cfg, p, p->flow, js);
-        }
-
-        if (aft->json_output_ctx->flags & LOG_JSON_PACKETHDR) {
-            JsonPacket(p, js, GET_PKT_LEN(p) < 32 ? GET_PKT_LEN(p) : 32);
-        }
+        jb_open_object(js, ANOMALY_EVENT_TYPE);
 
         if (event_code < DECODE_EVENT_MAX) {
             const char *event = DEvents[event_code].event_name;
-            json_object_set_new(ajs, "type",
-                                EVENT_IS_DECODER_PACKET_ERROR(event_code) ? 
-                                    json_string("decode") : json_string("stream"));
-            json_object_set_new(ajs, "event", json_string(event));
+            if (EVENT_IS_DECODER_PACKET_ERROR(event_code)) {
+                JB_SET_STRING(js, "type", "decode");
+            } else {
+                JB_SET_STRING(js, "type", "stream");
+            }
+            jb_set_string(js, "event", event);
         } else {
-            json_object_set_new(ajs, "type", json_string("unknown"));
-            json_object_set_new(ajs, "code", json_integer(event_code));
+            JB_SET_STRING(js, "type", "unknown");
+            jb_set_uint(js, "code", event_code);
         }
 
-        /* anomaly */
-        json_object_set_new(js, ANOMALY_EVENT_TYPE, ajs);
-        OutputJSONBuffer(js, aft->file_ctx, &aft->json_buffer);
+        /* Close anomaly object. */
+        jb_close(js);
 
-        json_object_clear(js);
-        json_decref(js);
+        if (aft->json_output_ctx->flags & LOG_JSON_PACKETHDR) {
+            EvePacket(p, js, GET_PKT_LEN(p) < 32 ? GET_PKT_LEN(p) : 32);
+        }
+
+        OutputJsonBuilderBuffer(js, aft->file_ctx, &aft->json_buffer);
+        jb_free(js);
     }
 
     return TM_ECODE_OK;
@@ -163,26 +175,22 @@ static int AnomalyAppLayerDecoderEventJson(JsonAnomalyLogThread *aft,
     for (int i = decoder_events->event_last_logged; i < decoder_events->cnt; i++) {
         MemBufferReset(aft->json_buffer);
 
-        json_t *js;
+        JsonBuilder *js;
         if (tx_id != TX_ID_UNUSED) {
-            js = CreateJSONHeaderWithTxId(p, LOG_DIR_PACKET,
-                                          ANOMALY_EVENT_TYPE, tx_id);
+            js = CreateEveHeaderWithTxId(p, LOG_DIR_PACKET,
+                                          ANOMALY_EVENT_TYPE, NULL, tx_id);
         } else {
-            js = CreateJSONHeader(p, LOG_DIR_PACKET, ANOMALY_EVENT_TYPE);
+            js = CreateEveHeader(p, LOG_DIR_PACKET, ANOMALY_EVENT_TYPE, NULL);
         }
         if (unlikely(js == NULL)) {
             return TM_ECODE_OK;
         }
 
-        json_t *ajs = json_object();
-        if (unlikely(ajs == NULL)) {
-            json_decref(js);
-            return TM_ECODE_OK;
-        }
+        EveAddCommonOptions(&aft->json_output_ctx->cfg, p, p->flow, js);
 
-        JsonAddCommonOptions(&aft->json_output_ctx->cfg, p, p->flow, js);
+        jb_open_object(js, ANOMALY_EVENT_TYPE);
 
-        json_object_set_new(js, "app_proto", json_string(alprotoname));
+        jb_set_string(js, "app_proto", alprotoname);
 
         const char *event_name = NULL;
         uint8_t event_code = decoder_events->events[i];
@@ -195,26 +203,19 @@ static int AnomalyAppLayerDecoderEventJson(JsonAnomalyLogThread *aft,
                                                event_code, &event_name, &event_type);
         }
         if (r == 0) {
-            json_object_set_new(ajs, "type", json_string("applayer"));
-            json_object_set_new(ajs, "event", json_string(event_name));
+            JB_SET_STRING(js, "type", "applayer");
+            jb_set_string(js, "event", event_name);
         } else {
-            json_object_set_new(ajs, "type", json_string("unknown"));
-            json_object_set_new(ajs, "code", json_integer(event_code));
+            JB_SET_STRING(js, "type", "unknown");
+            jb_set_uint(js, "code", event_code);
         }
 
-        /* log event number (and total) */
-        char event_no_buf[16];
-        snprintf(event_no_buf, sizeof(event_no_buf), "%d (of %d)",
-                        i+1, decoder_events->cnt);
-        json_object_set_new(ajs, "event_no", json_string(event_no_buf));
-        json_object_set_new(ajs, "layer", json_string(layer));
+        jb_set_string(js, "layer", layer);
 
         /* anomaly */
-        json_object_set_new(js, ANOMALY_EVENT_TYPE, ajs);
-        OutputJSONBuffer(js, aft->file_ctx, &aft->json_buffer);
-
-        json_object_clear(js);
-        json_decref(js);
+        jb_close(js);
+        OutputJsonBuilderBuffer(js, aft->file_ctx, &aft->json_buffer);
+        jb_free(js);
 
         /* Current implementation assumes a single owner for this value */
         decoder_events->event_last_logged++;
@@ -254,7 +255,6 @@ static inline bool AnomalyHasPacketAppLayerEvents(const Packet *p)
 
 static int AnomalyJson(ThreadVars *tv, JsonAnomalyLogThread *aft, const Packet *p)
 {
-
     int rc = TM_ECODE_OK;
 
     /* decode or stream */
@@ -308,23 +308,32 @@ static TmEcode JsonAnomalyLogThreadInit(ThreadVars *t, const void *initdata, voi
 
     if (initdata == NULL) {
         SCLogDebug("Error getting context for EveLogAnomaly.  \"initdata\" argument NULL");
-        SCFree(aft);
-        return TM_ECODE_FAILED;
+        goto error_exit;
     }
 
     aft->json_buffer = MemBufferCreateNew(JSON_OUTPUT_BUFFER_SIZE);
     if (aft->json_buffer == NULL) {
-        SCFree(aft);
-        return TM_ECODE_FAILED;
+        goto error_exit;
     }
 
     /** Use the Output Context (file pointer and mutex) */
     AnomalyJsonOutputCtx *json_output_ctx = ((OutputCtx *)initdata)->data;
-    aft->file_ctx = json_output_ctx->file_ctx;
+
+    aft->file_ctx = LogFileEnsureExists(json_output_ctx->file_ctx, t->id);
+    if (!aft->file_ctx) {
+        goto error_exit;
+    }
     aft->json_output_ctx = json_output_ctx;
 
     *data = (void *)aft;
     return TM_ECODE_OK;
+
+error_exit:
+    if (aft->json_buffer != NULL) {
+        MemBufferFree(aft->json_buffer);
+    }
+    SCFree(aft);
+    return TM_ECODE_FAILED;
 }
 
 static TmEcode JsonAnomalyLogThreadDeinit(ThreadVars *t, void *data)
@@ -343,7 +352,7 @@ static TmEcode JsonAnomalyLogThreadDeinit(ThreadVars *t, void *data)
     return TM_ECODE_OK;
 }
 
-static void JsonAnomalyLogDeInitCtxSub(OutputCtx *output_ctx)
+static void JsonAnomalyLogDeInitCtxSubHelper(OutputCtx *output_ctx)
 {
     SCLogDebug("cleaning up sub output_ctx %p", output_ctx);
 
@@ -353,6 +362,13 @@ static void JsonAnomalyLogDeInitCtxSub(OutputCtx *output_ctx)
         SCFree(json_output_ctx);
     }
     SCFree(output_ctx);
+}
+
+static void JsonAnomalyLogDeInitCtxSub(OutputCtx *output_ctx)
+{
+    OutputAnomalyLoggerDisable();
+
+    JsonAnomalyLogDeInitCtxSubHelper(output_ctx);
 }
 
 #define DEFAULT_LOG_FILENAME "anomaly.json"
@@ -372,8 +388,8 @@ static void SetFlag(const ConfNode *conf, const char *name, uint16_t flag, uint1
 static void JsonAnomalyLogConf(AnomalyJsonOutputCtx *json_output_ctx,
         ConfNode *conf)
 {
-    static bool _warn_no_flags = false;
-    static bool _warn_no_packet = false;
+    static bool warn_no_flags = false;
+    static bool warn_no_packet = false;
     uint16_t flags = ANOMALY_DEFAULTS;
     if (conf != NULL) {
         /* Check for metadata to enable/disable. */
@@ -385,27 +401,22 @@ static void JsonAnomalyLogConf(AnomalyJsonOutputCtx *json_output_ctx,
         }
         SetFlag(conf, "packethdr", LOG_JSON_PACKETHDR, &flags);
     }
-    if (((flags & (LOG_JSON_DECODE_TYPE | LOG_JSON_PACKETHDR)) == LOG_JSON_PACKETHDR) && !_warn_no_packet) {
+    if (((flags & (LOG_JSON_DECODE_TYPE | LOG_JSON_PACKETHDR)) == LOG_JSON_PACKETHDR) && !warn_no_packet) {
         SCLogWarning(SC_WARN_ANOMALY_CONFIG, "Anomaly logging configured to include packet headers, however decode "
                      "type logging has not been selected. Packet headers will not be logged.");
-        _warn_no_packet = true;
+        warn_no_packet = true;
         flags &= ~LOG_JSON_PACKETHDR;
     }
 
-    if (flags == 0 && !_warn_no_flags) {
+    if (flags == 0 && !warn_no_flags) {
         SCLogWarning(SC_WARN_ANOMALY_CONFIG, "Anomaly logging has been configured; however, no logging types "
                      "have been selected. Select one or more logging types.");
-        _warn_no_flags = true;
+        warn_no_flags = true;
     }
     json_output_ctx->flags |= flags;
 }
 
-/**
- * \brief Create a new LogFileCtx for "fast" output style.
- * \param conf The configuration node for this output.
- * \return A LogFileCtx pointer on success, NULL on failure.
- */
-static OutputInitResult JsonAnomalyLogInitCtxSub(ConfNode *conf, OutputCtx *parent_ctx)
+static OutputInitResult JsonAnomalyLogInitCtxHelper(ConfNode *conf, OutputCtx *parent_ctx)
 {
     OutputInitResult result = { NULL, false };
     OutputJsonCtx *ajt = parent_ctx->data;
@@ -425,7 +436,7 @@ static OutputInitResult JsonAnomalyLogInitCtxSub(ConfNode *conf, OutputCtx *pare
     json_output_ctx->cfg = ajt->cfg;
 
     output_ctx->data = json_output_ctx;
-    output_ctx->DeInit = JsonAnomalyLogDeInitCtxSub;
+    output_ctx->DeInit = JsonAnomalyLogDeInitCtxSubHelper;
 
     result.ctx = output_ctx;
     result.ok = true;
@@ -433,6 +444,29 @@ static OutputInitResult JsonAnomalyLogInitCtxSub(ConfNode *conf, OutputCtx *pare
 
 error:
     SCFree(output_ctx);
+
+    return result;
+}
+
+/**
+ * \brief Create a new LogFileCtx for "fast" output style.
+ * \param conf The configuration node for this output.
+ * \return A LogFileCtx pointer on success, NULL on failure.
+ */
+static OutputInitResult JsonAnomalyLogInitCtxSub(ConfNode *conf, OutputCtx *parent_ctx)
+{
+
+    if (!OutputAnomalyLoggerEnable()) {
+        OutputInitResult result = { NULL, false };
+        SCLogError(SC_ERR_CONF_YAML_ERROR, "only one 'anomaly' logger "
+                "can be enabled");
+        return result;
+    }
+
+    OutputInitResult result = JsonAnomalyLogInitCtxHelper(conf, parent_ctx);
+    if (result.ok) {
+        result.ctx->DeInit = JsonAnomalyLogDeInitCtxSub;
+    }
 
     return result;
 }
@@ -445,7 +479,7 @@ void JsonAnomalyLogRegister (void)
         NULL);
 
     OutputRegisterTxSubModule(LOGGER_JSON_ANOMALY, "eve-log", MODULE_NAME,
-        "eve-log.anomaly", JsonAnomalyLogInitCtxSub, ALPROTO_UNKNOWN,
+        "eve-log.anomaly", JsonAnomalyLogInitCtxHelper, ALPROTO_UNKNOWN,
         JsonAnomalyTxLogger, JsonAnomalyLogThreadInit,
         JsonAnomalyLogThreadDeinit, NULL);
 }

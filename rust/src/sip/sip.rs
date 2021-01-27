@@ -1,4 +1,4 @@
-/* Copyright (C) 2019 Open Information Security Foundation
+/* Copyright (C) 2019-2020 Open Information Security Foundation
  *
  * You can copy, redistribute or modify this Program under the terms of
  * the GNU General Public License version 2 as published by the Free
@@ -19,13 +19,10 @@
 
 extern crate nom;
 
-use applayer;
-use conf;
-use core;
-use core::{sc_detect_engine_state_free, AppProto, Flow, ALPROTO_UNKNOWN};
-use log::*;
-use parser::*;
-use sip::parser::*;
+use crate::applayer::{self, *};
+use crate::core;
+use crate::core::{sc_detect_engine_state_free, AppProto, Flow, ALPROTO_UNKNOWN};
+use crate::sip::parser::*;
 use std;
 use std::ffi::{CStr, CString};
 
@@ -58,7 +55,7 @@ pub struct SIPTransaction {
     pub response_line: Option<String>,
     de_state: Option<*mut core::DetectEngineState>,
     events: *mut core::AppLayerDecoderEvents,
-    logged: applayer::LoggerFlags,
+    tx_data: applayer::AppLayerTxData,
 }
 
 impl SIPState {
@@ -155,7 +152,7 @@ impl SIPTransaction {
             request_line: None,
             response_line: None,
             events: std::ptr::null_mut(),
-            logged: applayer::LoggerFlags::new(),
+            tx_data: applayer::AppLayerTxData::new(),
         }
     }
 }
@@ -172,7 +169,7 @@ impl Drop for SIPTransaction {
 }
 
 #[no_mangle]
-pub extern "C" fn rs_sip_state_new() -> *mut std::os::raw::c_void {
+pub extern "C" fn rs_sip_state_new(_orig_state: *mut std::os::raw::c_void, _orig_proto: AppProto) -> *mut std::os::raw::c_void {
     let state = SIPState::new();
     let boxed = Box::new(state);
     return unsafe { std::mem::transmute(boxed) };
@@ -209,35 +206,11 @@ pub extern "C" fn rs_sip_state_tx_free(state: *mut std::os::raw::c_void, tx_id: 
 }
 
 #[no_mangle]
-pub extern "C" fn rs_sip_state_progress_completion_status(_direction: u8) -> std::os::raw::c_int {
-    return 1;
-}
-
-#[no_mangle]
 pub extern "C" fn rs_sip_tx_get_alstate_progress(
     _tx: *mut std::os::raw::c_void,
     _direction: u8,
 ) -> std::os::raw::c_int {
     1
-}
-
-#[no_mangle]
-pub extern "C" fn rs_sip_tx_set_logged(
-    _state: *mut std::os::raw::c_void,
-    tx: *mut std::os::raw::c_void,
-    logged: u32,
-) {
-    let tx = cast_pointer!(tx, SIPTransaction);
-    tx.logged.set(logged);
-}
-
-#[no_mangle]
-pub extern "C" fn rs_sip_tx_get_logged(
-    _state: *mut std::os::raw::c_void,
-    tx: *mut std::os::raw::c_void,
-) -> u32 {
-    let tx = cast_pointer!(tx, SIPTransaction);
-    return tx.logged.get();
 }
 
 #[no_mangle]
@@ -358,14 +331,10 @@ pub extern "C" fn rs_sip_parse_request(
     input_len: u32,
     _data: *const std::os::raw::c_void,
     _flags: u8,
-) -> i32 {
+) -> AppLayerResult {
     let buf = build_slice!(input, input_len as usize);
     let state = cast_pointer!(state, SIPState);
-    if state.parse_request(buf) {
-        1
-    } else {
-        -1
-    }
+    state.parse_request(buf).into()
 }
 
 #[no_mangle]
@@ -377,15 +346,13 @@ pub extern "C" fn rs_sip_parse_response(
     input_len: u32,
     _data: *const std::os::raw::c_void,
     _flags: u8,
-) -> i32 {
+) -> AppLayerResult {
     let buf = build_slice!(input, input_len as usize);
     let state = cast_pointer!(state, SIPState);
-    if state.parse_response(buf) {
-        1
-    } else {
-        -1
-    }
+    state.parse_response(buf).into()
 }
+
+export_tx_data_get!(rs_sip_get_tx_data, SIPTransaction);
 
 const PARSER_NAME: &'static [u8] = b"sip\0";
 
@@ -396,8 +363,8 @@ pub unsafe extern "C" fn rs_sip_register_parser() {
         name: PARSER_NAME.as_ptr() as *const std::os::raw::c_char,
         default_port: default_port.as_ptr(),
         ipproto: core::IPPROTO_UDP,
-        probe_ts: rs_sip_probing_parser_ts,
-        probe_tc: rs_sip_probing_parser_tc,
+        probe_ts: Some(rs_sip_probing_parser_ts),
+        probe_tc: Some(rs_sip_probing_parser_tc),
         min_depth: 0,
         max_depth: 16,
         state_new: rs_sip_state_new,
@@ -407,10 +374,9 @@ pub unsafe extern "C" fn rs_sip_register_parser() {
         parse_tc: rs_sip_parse_response,
         get_tx_count: rs_sip_state_get_tx_count,
         get_tx: rs_sip_state_get_tx,
-        tx_get_comp_st: rs_sip_state_progress_completion_status,
+        tx_comp_st_ts: 1,
+        tx_comp_st_tc: 1,
         tx_get_progress: rs_sip_tx_get_alstate_progress,
-        get_tx_logged: Some(rs_sip_tx_get_logged),
-        set_tx_logged: Some(rs_sip_tx_set_logged),
         get_de_state: rs_sip_state_get_tx_detect_state,
         set_de_state: rs_sip_state_set_tx_detect_state,
         get_events: Some(rs_sip_state_get_events),
@@ -418,17 +384,13 @@ pub unsafe extern "C" fn rs_sip_register_parser() {
         get_eventinfo_byid: Some(rs_sip_state_get_event_info_by_id),
         localstorage_new: None,
         localstorage_free: None,
-        get_tx_mpm_id: None,
-        set_tx_mpm_id: None,
         get_files: None,
         get_tx_iterator: None,
+        get_tx_data: rs_sip_get_tx_data,
+        apply_tx_config: None,
+        flags: APP_LAYER_PARSER_OPT_UNIDIR_TXS,
+        truncate: None,
     };
-
-    /* For 5.0 we want this disabled by default, so check that it
-     * has been explicitly enabled. */
-    if !conf::conf_get_bool("app-layer.protocols.sip.enabled") {
-        return;
-    }
 
     let ip_proto_str = CString::new("udp").unwrap();
     if AppLayerProtoDetectConfProtoDetectionEnabled(ip_proto_str.as_ptr(), parser.name) != 0 {

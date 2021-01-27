@@ -1,7 +1,8 @@
 Transformations
 ===============
 
-Transformation keywords turn the data at a sticky buffer into something else.
+Transformation keywords turn the data at a sticky buffer into something else. Some transformations
+support options for greater control over the transformation process
 
 Example::
 
@@ -12,7 +13,7 @@ This example will match on traffic even if there are one or more spaces between
 the ``navigate`` and ``(``.
 
 The transforms can be chained. They are processed in the order in which they
-appear in a rule. Each transforms output acts as input for the next one.
+appear in a rule. Each transform's output acts as input for the next one.
 
 Example::
 
@@ -78,8 +79,6 @@ Example::
     alert http any any -> any any (http_request_line; to_md5; \
         content:"|54 A9 7A 8A B0 9C 1B 81 37 25 22 14 51 D3 F9 97|"; sid:1;)
 
-.. note:: depends on libnss being compiled into Suricata
-
 to_sha1
 ---------
 
@@ -90,8 +89,6 @@ Example::
 
     alert http any any -> any any (http_request_line; to_sha1; \
         content:"|54A9 7A8A B09C 1B81 3725 2214 51D3 F997 F015 9DD7|"; sid:1;)
-
-.. note:: depends on libnss being compiled into Suricata
 
 to_sha256
 ---------
@@ -104,5 +101,22 @@ Example::
     alert http any any -> any any (http_request_line; to_sha256; \
         content:"|54A9 7A8A B09C 1B81 3725 2214 51D3 F997 F015 9DD7 049E E5AD CED3 945A FC79 7401|"; sid:1;)
 
-.. note:: depends on libnss being compiled into Suricata
+pcrexform
+---------
 
+Takes the buffer, applies the required regular expression, and outputs the *first captured expression*.
+
+.. note:: this transform requires a mandatory option string containing a regular expression.
+
+
+This example alerts if ``http.request_line`` contains ``/dropper.php``
+Example::
+
+    alert http any any -> any any (msg:"HTTP with pcrexform"; http.request_line; \
+        pcrexform:"[a-zA-Z]+\s+(.*)\s+HTTP"; content:"/dropper.php"; sid:1;)
+
+url_decode
+----------
+
+Decodes url-encoded data, ie replacing '+' with space and '%HH' with its value.
+This does not decode unicode '%uZZZZ' encoding

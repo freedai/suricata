@@ -54,7 +54,6 @@
 
 #include "rust.h"
 #include "app-layer-sip.h"
-#include "rust-sip-detect-gen.h"
 
 #define KEYWORD_NAME "sip.protocol"
 #define KEYWORD_DOC  "sip-keywords.html#sip-protocol"
@@ -98,7 +97,7 @@ void DetectSipProtocolRegister(void)
     /* sip.protocol sticky buffer */
     sigmatch_table[DETECT_AL_SIP_PROTOCOL].name = KEYWORD_NAME;
     sigmatch_table[DETECT_AL_SIP_PROTOCOL].desc = "sticky buffer to match on the SIP protocol";
-    sigmatch_table[DETECT_AL_SIP_PROTOCOL].url = DOC_URL DOC_VERSION "/rules/" KEYWORD_DOC;
+    sigmatch_table[DETECT_AL_SIP_PROTOCOL].url = "/rules/" KEYWORD_DOC;
     sigmatch_table[DETECT_AL_SIP_PROTOCOL].Setup = DetectSipProtocolSetup;
     sigmatch_table[DETECT_AL_SIP_PROTOCOL].flags |= SIGMATCH_NOOPT;
 

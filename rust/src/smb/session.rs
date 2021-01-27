@@ -15,7 +15,6 @@
  * 02110-1301, USA.
  */
 
-use crate::log::*;
 use crate::kerberos::*;
 use crate::smb::smb::*;
 use crate::smb::smb1_session::*;
@@ -42,7 +41,7 @@ impl SMBTransactionSessionSetup {
 
 impl SMBState {
     pub fn new_sessionsetup_tx(&mut self, hdr: SMBCommonHdr)
-        -> (&mut SMBTransaction)
+        -> &mut SMBTransaction
     {
         let mut tx = self.new_tx();
 

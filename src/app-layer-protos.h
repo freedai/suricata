@@ -33,7 +33,6 @@ enum AppProtoEnum {
     ALPROTO_TLS, /* SSLv2, SSLv3 & TLSv1 */
     ALPROTO_SSH,
     ALPROTO_IMAP,
-    ALPROTO_MSN,
     ALPROTO_JABBER,
     ALPROTO_SMB,
     ALPROTO_DCERPC,
@@ -52,9 +51,12 @@ enum AppProtoEnum {
     ALPROTO_DHCP,
     ALPROTO_SNMP,
     ALPROTO_SIP,
+    ALPROTO_RFB,
+    ALPROTO_MQTT,
     ALPROTO_TEMPLATE,
     ALPROTO_TEMPLATE_RUST,
     ALPROTO_RDP,
+    ALPROTO_HTTP2,
 
     /* used by the probing parser when alproto detection fails
      * permanently for that particular stream */

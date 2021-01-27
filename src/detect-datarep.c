@@ -1,4 +1,4 @@
-/* Copyright (C) 2018-2019 Open Information Security Foundation
+/* Copyright (C) 2018-2020 Open Information Security Foundation
  *
  * You can copy, redistribute or modify this Program under the terms of
  * the GNU General Public License version 2 as published by the Free
@@ -38,25 +38,25 @@
 #include "util-byte.h"
 #include "util-debug.h"
 #include "util-print.h"
+#include "util-misc.h"
 
 #define PARSE_REGEX         "([a-z]+)(?:,\\s*([\\-_A-z0-9\\s\\.]+)){1,4}"
-static pcre *parse_regex;
-static pcre_extra *parse_regex_study;
+static DetectParseRegex parse_regex;
 
 int DetectDatarepMatch (ThreadVars *, DetectEngineThreadCtx *, Packet *,
         const Signature *, const SigMatchCtx *);
 static int DetectDatarepSetup (DetectEngineCtx *, Signature *, const char *);
-void DetectDatarepFree (void *);
+void DetectDatarepFree (DetectEngineCtx *, void *);
 
 void DetectDatarepRegister (void)
 {
     sigmatch_table[DETECT_DATAREP].name = "datarep";
-    sigmatch_table[DETECT_DATAREP].desc = "operate on datasets";
-    sigmatch_table[DETECT_DATAREP].url = DOC_URL DOC_VERSION "/rules/dataset-keywords.html#datarep";
+    sigmatch_table[DETECT_DATAREP].desc = "operate on datasets (experimental)";
+    sigmatch_table[DETECT_DATAREP].url = "/rules/dataset-keywords.html#datarep";
     sigmatch_table[DETECT_DATAREP].Setup = DetectDatarepSetup;
     sigmatch_table[DETECT_DATAREP].Free  = DetectDatarepFree;
 
-    DetectSetupParseRegexes(PARSE_REGEX, &parse_regex, &parse_regex_study);
+    DetectSetupParseRegexes(PARSE_REGEX, &parse_regex);
 }
 
 /*
@@ -92,12 +92,9 @@ int DetectDatarepBufferMatch(DetectEngineThreadCtx *det_ctx,
     return 0;
 }
 
-static int DetectDatarepParse(const char *str,
-        char *cmd, int cmd_len,
-        char *name, int name_len,
-        enum DatasetTypes *type,
-        char *load, size_t load_size,
-        uint16_t *rep_value)
+static int DetectDatarepParse(const char *str, char *cmd, int cmd_len, char *name, int name_len,
+        enum DatasetTypes *type, char *load, size_t load_size, uint16_t *rep_value,
+        uint64_t *memcap, uint32_t *hashsize)
 {
     bool cmd_set = false;
     bool name_set = false;
@@ -143,7 +140,7 @@ static int DetectDatarepParse(const char *str,
                 return -1;
             }
 
-            if (ByteExtractStringUint16(rep_value, 10, 0, key) != (int)strlen(key))
+            if (StringParseUint16(rep_value, 10, 0, key) < 0)
                 return -1;
 
             value_set = true;
@@ -169,6 +166,24 @@ static int DetectDatarepParse(const char *str,
             } else if (strcmp(key, "load") == 0) {
                 SCLogDebug("load %s", val);
                 strlcpy(load, val, load_size);
+            }
+            if (strcmp(key, "memcap") == 0) {
+                if (ParseSizeStringU64(val, memcap) < 0) {
+                    SCLogWarning(SC_ERR_INVALID_VALUE,
+                            "invalid value for memcap: %s,"
+                            " resetting to default",
+                            val);
+                    *memcap = 0;
+                }
+            }
+            if (strcmp(key, "hashsize") == 0) {
+                if (ParseSizeStringU32(val, hashsize) < 0) {
+                    SCLogWarning(SC_ERR_INVALID_VALUE,
+                            "invalid value for hashsize: %s,"
+                            " resetting to default",
+                            val);
+                    *hashsize = 0;
+                }
             }
         }
 
@@ -278,8 +293,10 @@ static int DetectDatarepSetup (DetectEngineCtx *de_ctx, Signature *s, const char
     SigMatch *sm = NULL;
     char cmd_str[16] = "", name[64] = "";
     enum DatasetTypes type = DATASET_TYPE_NOTSET;
-    char load[PATH_MAX];
+    char load[PATH_MAX] = "";
     uint16_t value = 0;
+    uint64_t memcap = 0;
+    uint32_t hashsize = 0;
 
     if (DetectBufferGetActiveList(de_ctx, s) == -1) {
         SCLogError(SC_ERR_INVALID_SIGNATURE,
@@ -294,8 +311,8 @@ static int DetectDatarepSetup (DetectEngineCtx *de_ctx, Signature *s, const char
         SCReturnInt(-1);
     }
 
-    if (!DetectDatarepParse(rawstr, cmd_str, sizeof(cmd_str), name,
-            sizeof(name), &type, load, sizeof(load), &value)) {
+    if (!DetectDatarepParse(rawstr, cmd_str, sizeof(cmd_str), name, sizeof(name), &type, load,
+                sizeof(load), &value, &memcap, &hashsize)) {
         return -1;
     }
 
@@ -317,7 +334,7 @@ static int DetectDatarepSetup (DetectEngineCtx *de_ctx, Signature *s, const char
         return -1;
     }
 
-    Dataset *set = DatasetGet(name, type, /* no save */ NULL, load);
+    Dataset *set = DatasetGet(name, type, /* no save */ NULL, load, memcap, hashsize);
     if (set == NULL) {
         SCLogError(SC_ERR_UNKNOWN_VALUE,
                 "failed to set up datarep set '%s'.", name);
@@ -354,7 +371,7 @@ error:
     return -1;
 }
 
-void DetectDatarepFree (void *ptr)
+void DetectDatarepFree (DetectEngineCtx *de_ctx, void *ptr)
 {
     DetectDatarepData *fd = (DetectDatarepData *)ptr;
 
